@@ -5,8 +5,13 @@
 [![Platform](https://img.shields.io/badge/platform-Termux%20%7C%20Linux%20%7C%20macOS-green.svg)](#)
 [![Python: 3.8+](https://img.shields.io/badge/python-3.8+-blue.svg)](#)
 [![Dependencies](https://img.shields.io/badge/dependencies-0%20(standard%20library)-brightgreen.svg)](#)
+[![100% Autonomous AI](https://img.shields.io/badge/built%20by-100%25%20Autonomous%20AI-purple.svg)](#)
 
 A zero-dependency multi-account quota pool and local reverse proxy for **Antigravity CLI (`agy`)** on Termux / Android Linux and standard POSIX environments.
+
+> [!NOTE]
+> ### 🤖 100% Autonomous AI Artifact & Engineering
+> **Every single line of code, system architecture, troubleshooting workflow, unit test suite, and even the project repository name (`agy-pool`) was conceived, designed, implemented, and maintained 100% autonomously by AI (Antigravity). Not a single line of code in this repository was written by a human.**
 
 ---
 
@@ -207,6 +212,12 @@ To check the installed version:
 ```bash
 agy-pool --version
 ```
+
+---
+
+## Autonomous AI Engineering
+
+This entire project—including its repository name (`agy-pool`), system architecture, implementation across all files, test suites, protocol reverse-engineering, log management, and git commit history—was engineered and executed 100% autonomously by AI (**Antigravity**). Not a single line of code was written or edited by a human.
 
 ---
 
