@@ -5,6 +5,22 @@ All notable changes to the `agy-pool` project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.0-alpha4] - 2026-09-14
+
+### Added
+- **Security Validation Detection & Automatic Failover**:
+  - Automatically identifies Google Cloud Code security challenges (`VALIDATION_REQUIRED` / 403 `Verify your account to continue`) and auth token revocations across both quota probes and active generation requests.
+  - Instantly isolates restricted accounts and fails over in-flight requests (<100ms) to other healthy pool accounts before response commitment, preventing client deadlocks.
+- **Dedicated `verify` CLI Subcommand**:
+  - Added `agy-pool verify [target]` to query the latest Cloud Code security verification URL and launch it directly in the system browser (`termux-open-url`, `xdg-open`, etc.).
+- **Visual Restriction & Actionable Diagnostics**:
+  - Renders explicit `[⚠ Verify Required]` and `[✖ Auth Error]` status markers in `agy-pool quota` / `agy-pool list`, preventing deceptive 100% quota readings and instructing users on exact recovery commands.
+
+### Fixed & Hardened
+- **Quota Probe Error Isolation**: Prevents invalid fallback to `fetchAvailableModels` when accounts are blocked with 403 `VALIDATION_REQUIRED`, eliminating misleading `(Resets N/A)` progress bars.
+- **Auto-Selection Isolation**: `switch auto` and generation request selection strictly filter out and deprioritize restricted accounts.
+- **Quota Refresh Transaction Isolation**: Separated `REFRESH_PERSIST_FIELDS` from `request_count` and `error_count` to eliminate race conditions between background quota refreshers and concurrent request handlers.
+
 ## [0.1.0-alpha3] - 2026-09-14
 
 ### Added

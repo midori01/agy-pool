@@ -1,6 +1,6 @@
 # agy-pool: Antigravity Multi-Account Quota Pool & Intelligent Load Balancer Suite
 
-[![Version](https://img.shields.io/badge/version-0.1.0--alpha3-blue.svg)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-0.1.0--alpha4-blue.svg)](CHANGELOG.md)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Platform](https://img.shields.io/badge/platform-Termux%20%7C%20Linux%20%7C%20macOS-green.svg)](#)
 [![Python: 3.8+](https://img.shields.io/badge/python-3.8+-blue.svg)](#)
@@ -16,13 +16,17 @@ A zero-dependency multi-account quota pool and local reverse proxy for **Antigra
 - **Account-Agnostic Workspace Session Continuity (`agy -c`)**:
   - Automatically queries the global conversation store (`conversation_summaries.db`) to locate the most recently active session for the current working directory, regardless of which account originally created it.
   - Maps `agy -c` to `--conversation <id>`. The lookup uses a read-only SQLite connection and may fall back to native behavior if the database stays busy or unavailable.
+- **Security Validation & Account Isolation Failover**:
+  - Detects Google Cloud Code account security verification challenges (`VALIDATION_REQUIRED` / 403 `Verify your account to continue`) and auth token revocations.
+  - Automatically isolates restricted accounts to prevent quota deadlocks and immediately fails over generation requests to other healthy accounts (<100ms), keeping interactive sessions uninterrupted.
+  - Provides `agy-pool verify <target>` to launch the dedicated Cloud Code security verification flow in the system browser.
 - **Native User-Agent Preservation**:
   - Forwards an official `antigravity/cli/...` User-Agent while leaving model availability to the native client and upstream service.
 - **HTTP/1.1 Token Streaming**:
   - Requests uncompressed upstream responses and relays SSE using valid chunked framing.
   - If an upstream stream fails after response data is committed, the client receives a truncated/failed response; the request is not replayed on another account.
-- **Pre-Stream Quota Failover**:
-  - HTTP 429 and recognized quota-exhaustion HTTP 403 responses can retry another account only before a response is committed to the client.
+- **Pre-Stream Quota & Security Failover**:
+  - HTTP 429, recognized quota-exhaustion HTTP 403, and account security verification challenges retry another healthy account before a response is committed to the client.
   - Network failures, permission-related 403 responses, and partially emitted streams are not silently replayed.
 - **Cached-Quota Request Load Balancing**:
   - Generation requests prefer accounts using cached quota, cooldown and request-count data. The daemon refreshes quota about every 180 seconds; `list`, `quota`, and `switch auto` also request a refresh.
@@ -89,6 +93,7 @@ The installation script will automatically:
 | `agy-pool import-current` | - | Import current `~/.gemini/` credentials into the account pool |
 | `agy-pool switch auto` | - | Switch active account to the one with the highest remaining quota |
 | `agy-pool switch <ID/Email>` | e.g. `agy-pool switch 2` | Manually activate a specific account by index or email |
+| `agy-pool verify [ID/Email]` | e.g. `agy-pool verify 4` | Open Google security verification URL for restricted account in browser |
 | `agy-pool remove <ID/Email>` | e.g. `agy-pool remove 2` | Remove an account from the pool |
 
 Quota Dashboard Output Example:

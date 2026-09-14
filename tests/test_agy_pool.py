@@ -319,6 +319,40 @@ class AgyPoolTest(unittest.TestCase):
         self.assertEqual(self.request(proxy)[0:2], (403, b'{"error":{"status":"PERMISSION_DENIED"}}'))
         self.assertEqual([call[0] for call in denied.calls], ["token-a"])
 
+    def test_validation_required_fails_over_and_persists_status(self):
+        self.save_accounts([account("a"), account("b")])
+        val_error = {
+            "error": {
+                "code": 403,
+                "message": "Verify your account to continue.",
+                "status": "PERMISSION_DENIED",
+                "details": [
+                    {
+                        "@type": "type.googleapis.com/google.rpc.ErrorInfo",
+                        "reason": "VALIDATION_REQUIRED",
+                        "metadata": {
+                            "validation_url": "https://accounts.google.com/signin/continue?foo=bar"
+                        }
+                    }
+                ]
+            }
+        }
+        val_body = json.dumps(val_error).encode()
+        scenario = Scenario({
+            "token-a": [(403, val_body, {})],
+            "token-b": [(200, b"success-from-b", {})],
+        })
+        proxy = self.start_proxy(scenario)
+        status, body, _ = self.request(proxy, "/v1internal:streamGenerateContent")
+        self.assertEqual((status, body), (200, b"success-from-b"))
+        self.assertEqual([call[0] for call in scenario.calls], ["token-a", "token-b"])
+
+        pool = agy_pool.load_pool()
+        acc_a = next(a for a in pool["accounts"] if a["id"] == "a")
+        self.assertEqual(acc_a.get("status"), "validation_required")
+        self.assertEqual(acc_a.get("validation_url"), "https://accounts.google.com/signin/continue?foo=bar")
+        self.assertEqual(acc_a.get("last_quota", {}).get("remaining_fraction"), 0.0)
+
     def test_started_sse_failure_is_not_replayed(self):
         self.save_accounts([account("a"), account("b")])
 
@@ -574,6 +608,24 @@ class AgyPoolTest(unittest.TestCase):
         result = subprocess.run(["bash", os.path.join(ROOT, "bin", "agy-raw"), "--model", "x"],
                                 env=env, text=True, capture_output=True, check=True)
         self.assertEqual(result.stdout.splitlines(), ["unset", "--model", "x"])
+
+    def test_do_verify_opens_browser_and_clears_status(self):
+        acc = account("a")
+        acc["status"] = "validation_required"
+        acc["validation_url"] = "https://accounts.google.com/verify-test"
+        self.save_accounts([acc])
+
+        def fake_query(account_data):
+            account_data.pop("status", None)
+            account_data.pop("validation_url", None)
+            agy_pool._persist_account_fields(account_data, ("status", "validation_url"))
+            return {"remaining_fraction": 1.0}
+
+        with mock.patch.object(agy_pool, "query_quota", fake_query):
+            res = agy_pool.do_verify("a")
+            self.assertTrue(res)
+            pool = agy_pool.load_pool()
+            self.assertIsNone(pool["accounts"][0].get("status"))
 
 
 if __name__ == "__main__":
