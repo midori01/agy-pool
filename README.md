@@ -6,7 +6,7 @@
 [![Python: 3.8+](https://img.shields.io/badge/python-3.8+-blue.svg)](#)
 [![Dependencies](https://img.shields.io/badge/dependencies-0%20(standard%20library)-brightgreen.svg)](#)
 
-An enterprise-grade, zero-dependency multi-account quota pool, dynamic load balancer, and high-availability reverse proxy gateway designed for **Antigravity CLI (`agy`)** on Termux / Android Linux and standard POSIX environments.
+A zero-dependency multi-account quota pool and local reverse proxy for **Antigravity CLI (`agy`)** on Termux / Android Linux and standard POSIX environments.
 
 ---
 
@@ -15,27 +15,26 @@ An enterprise-grade, zero-dependency multi-account quota pool, dynamic load bala
 - **Zero External Dependencies**: Built 100% on the standard Python 3 runtime. No `pip`, no wheel compilation, and no third-party package dependencies required.
 - **Account-Agnostic Workspace Session Continuity (`agy -c`)**:
   - Automatically queries the global conversation store (`conversation_summaries.db`) to locate the most recently active session for the current working directory, regardless of which account originally created it.
-  - Transparently maps `agy -c` to `--conversation <id>`, eliminating conversation fragmentation, account silos, or stale session conflicts when switching accounts.
-- **Native Full-Catalog Model Support (Including Gemini 3.8 Flash)**:
-  - Dynamically aligns official client User-Agent characteristics (`antigravity/cli/...`) to unlock Google's entire Cloud Code model catalog (`gemini-3.8-flash-high`, etc.).
-  - Completely eliminates the *"Gemini 3.8 Flash is no longer available. Using Gemini 3.6 Flash"* auto-downgrade warning.
-- **Sub-Millisecond Real-Time Token Streaming**:
-  - Strips upstream Gzip compression to eliminate DEFLATE buffering deadlocks on Server-Sent Events (`/v1internal:streamGenerateContent?alt=sse`), delivering real-time, typewriter-style token emission.
-  - Bidirectional support for both standard `Content-Length` framing and HTTP/1.1 `Transfer-Encoding: chunked` streaming, preventing the terminal interface from hanging on `working`.
-- **Sub-100ms In-Flight 429 Failover**:
-  - If the active account exhausts its 5-hour or weekly quota during generation (HTTP 429 ResourceExhausted), the gateway intercepts the error and seamlessly retries with the next healthy account in **under 100ms**.
-  - Your conversation never crashes, never throws an error, and continues typing uninterrupted.
-- **Smart Request-Level Load Balancing (Max-Remaining First)**:
-  - Automatically dispatches prompt invocations and tool calls across healthy pool accounts to evenly distribute 5-hour quota consumption.
+  - Maps `agy -c` to `--conversation <id>`. The lookup uses a read-only SQLite connection and may fall back to native behavior if the database stays busy or unavailable.
+- **Native User-Agent Preservation**:
+  - Forwards an official `antigravity/cli/...` User-Agent while leaving model availability to the native client and upstream service.
+- **HTTP/1.1 Token Streaming**:
+  - Requests uncompressed upstream responses and relays SSE using valid chunked framing.
+  - If an upstream stream fails after response data is committed, the client receives a truncated/failed response; the request is not replayed on another account.
+- **Pre-Stream Quota Failover**:
+  - HTTP 429 and recognized quota-exhaustion HTTP 403 responses can retry another account only before a response is committed to the client.
+  - Network failures, permission-related 403 responses, and partially emitted streams are not silently replayed.
+- **Cached-Quota Request Load Balancing**:
+  - Generation requests prefer accounts using cached quota, cooldown and request-count data. The daemon refreshes quota about every 180 seconds; `list`, `quota`, and `switch auto` also request a refresh.
 - **One-Click Browser OAuth**:
   - Automatically triggers the default system browser for Google OAuth sign-in.
   - Full fallback support for headless terminals and remote SSH sessions via manual authorization code pasting.
 - **Dual Operating Modes**:
-  - **Default Command `agy`**: Automatically wakes the background gateway daemon and enables multi-account load balancing with instant failover.
+  - **Default Command `agy`**: Automatically wakes the background gateway daemon and enables multi-account load balancing with pre-stream quota failover.
   - **Direct Command `agy-raw` / `agy-orig`**: Completely bypasses the local proxy and connects 100% directly to Google Cloud Code PA as a failsafe.
 - **Future-Proof & Zero-Invasive Architecture**:
-  - **New Models**: Uses raw payload pass-through. When Google releases Gemini 3.9, 4.0, or other new models, they become available in the CLI automatically without modifying `agy-pool`.
-  - **CLI Updates**: Dynamically launches the system's native `agy` binary via `execvpe`. When `agy` updates, all new features, flags, and slash commands are preserved 1:1.
+  - **New Models**: Uses raw payload pass-through and does not maintain a local model allow-list.
+  - **CLI Updates**: Dynamically launches the system's native `agy` binary via `execvpe` and passes arguments through unchanged.
 
 ---
 
@@ -53,7 +52,7 @@ cd ~/agy-pool && bash install.sh
 
 ### Option B: Clone / Install from Source
 ```bash
-git clone https://github.com/midori01/agy-pool.git ~/agy-pool
+git clone https://github.com/vlxlv/agy-pool.git ~/agy-pool
 cd ~/agy-pool && bash install.sh
 ```
 
@@ -76,7 +75,7 @@ The installation script will automatically:
 | **`agy-raw`** | Direct connection to Google (bypasses local proxy) | Debugging & network fallback |
 | **`agy-orig`** | Alias for `agy-raw` | Same as above |
 
-> **Note**: All native `agy` CLI flags (e.g., `--model ...`, `-p "prompt"`, `--help`) are passed through untouched.
+> **Note**: Native `agy` CLI arguments are passed through unchanged, except `-c` / `--continue`, which is resolved as described above.
 
 ---
 
@@ -84,8 +83,8 @@ The installation script will automatically:
 
 | Command | Alias / Args | Description |
 | :--- | :--- | :--- |
-| `agy-pool list` | `agy-pool quota` | Display visual quota progress bars (5h/Weekly), reset countdowns, and request hits |
-| `agy-pool status` | - | Check gateway daemon status and view real-time account quotas |
+| `agy-pool list` | `agy-pool quota` | Refresh when possible, then display cached quota, reset countdowns, and request hits |
+| `agy-pool status` | - | Check gateway status, refresh when possible, and display cached quotas |
 | `agy-pool login` | - | Authenticate and add a new Google account via system browser |
 | `agy-pool import-current` | - | Import current `~/.gemini/` credentials into the account pool |
 | `agy-pool switch auto` | - | Switch active account to the one with the highest remaining quota |
@@ -152,17 +151,19 @@ You can verify gateway usage in 3 ways:
 
 ### Q2: Why did the "Gemini 3.8 Flash is no longer available" warning occur previously?
 
-Google Cloud Code PA checks incoming client `User-Agent` headers. If the request lacks an official `antigravity/cli/...` identifier, Google assumes an outdated client, completely hides 3.8 models, and falls back to 3.6.
+The upstream service uses the client `User-Agent` as part of client-version and model-availability handling. An unrecognized value can produce model availability warnings or fallback behavior.
 
-`agy-pool` features dynamic User-Agent preservation: it automatically passes through the client's official UA and dynamically detects the installed `agy` version, guaranteeing full Gemini 3.8 Flash (High) availability.
+`agy-pool` preserves an official client User-Agent and dynamically detects the installed `agy` version. Final model availability remains controlled by the native client and upstream service.
 
 ---
 
 ### Q3: Will future agy-cli updates or new Google models break agy-pool?
 
-**No.**
-* **New Models**: The gateway operates as a transparent reverse proxy. It does not validate or restrict model names in JSON payloads. When Google releases Gemini 3.9 or 4.0, they become available to your CLI immediately.
-* **CLI Updates**: `agy-pool run` uses dynamic process execution (`execvpe`) targeting the native `agy` binary in PATH. Any upstream binary update takes effect automatically with full argument and slash command support.
+The proxy does not validate model names and `agy-pool run` passes CLI arguments to the native binary unchanged. Upstream API or authentication changes can still require an `agy-pool` update.
+
+### Q4: Which account state is authoritative during a proxied session?
+
+Each proxied HTTP request uses the account selected by the gateway and its request-level `Authorization` header. The native token file at `~/.gemini/antigravity-cli/antigravity-oauth-token` is compatibility state synchronized when a session starts or an account is explicitly switched. Automatic request failover does not rewrite that global file, so concurrent running sessions cannot churn it on every failover.
 
 ---
 
