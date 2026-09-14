@@ -1,6 +1,6 @@
 # agy-pool: Antigravity Multi-Account Quota Pool & Intelligent Load Balancer Suite
 
-[![Version](https://img.shields.io/badge/version-0.1.0--alpha-blue.svg)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-0.1.0--alpha2-blue.svg)](CHANGELOG.md)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Platform](https://img.shields.io/badge/platform-Termux%20%7C%20Linux%20%7C%20macOS-green.svg)](#)
 [![Python: 3.8+](https://img.shields.io/badge/python-3.8+-blue.svg)](#)
@@ -13,6 +13,9 @@ An enterprise-grade, zero-dependency multi-account quota pool, dynamic load bala
 ## Highlights
 
 - **Zero External Dependencies**: Built 100% on the standard Python 3 runtime. No `pip`, no wheel compilation, and no third-party package dependencies required.
+- **Account-Agnostic Workspace Session Continuity (`agy -c`)**:
+  - Automatically queries the global conversation store (`conversation_summaries.db`) to locate the most recently active session for the current working directory, regardless of which account originally created it.
+  - Transparently maps `agy -c` to `--conversation <id>`, eliminating conversation fragmentation, account silos, or stale session conflicts when switching accounts.
 - **Native Full-Catalog Model Support (Including Gemini 3.8 Flash)**:
   - Dynamically aligns official client User-Agent characteristics (`antigravity/cli/...`) to unlock Google's entire Cloud Code model catalog (`gemini-3.8-flash-high`, etc.).
   - Completely eliminates the *"Gemini 3.8 Flash is no longer available. Using Gemini 3.6 Flash"* auto-downgrade warning.
@@ -69,7 +72,7 @@ The installation script will automatically:
 | Command | Description | Best For |
 | :--- | :--- | :--- |
 | **`agy`** | Launch new session with auto load balancing & failover | **Daily default use** |
-| **`agy -c`** | Resume previous conversation (with hot 429 failover) | Continuing workflows |
+| **`agy -c`** | Resume previous conversation for directory across accounts | Continuing workflows |
 | **`agy-raw`** | Direct connection to Google (bypasses local proxy) | Debugging & network fallback |
 | **`agy-orig`** | Alias for `agy-raw` | Same as above |
 

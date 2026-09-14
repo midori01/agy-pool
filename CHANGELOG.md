@@ -5,6 +5,14 @@ All notable changes to the `agy-pool` project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.0-alpha2] - 2026-09-14
+
+### Added
+- **Account-Agnostic Workspace Session Continuity (`agy -c`)**:
+  - Automatically queries `~/.gemini/antigravity-cli/conversation_summaries.db` to locate the true latest conversation for the current workspace directory (with hierarchical parent-directory walk-up support).
+  - Resolves `-c` / `--continue` directly into `--conversation <cid>`, guaranteeing that switching Google accounts or changing active account never fragments or creates new conversations in the same directory.
+  - Detects active process presence locks to prevent race conditions across parallel terminal windows.
+
 ## [0.1.0-alpha] - 2026-09-14
 
 ### Added
