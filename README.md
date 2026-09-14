@@ -15,45 +15,19 @@ A zero-dependency multi-account quota pool and local reverse proxy for **Antigra
 
 ---
 
-## Highlights
+## Key Capabilities
 
-- **Zero External Dependencies**: Built 100% on the standard Python 3 runtime. No `pip`, no wheel compilation, and no third-party package dependencies required.
-- **Account-Agnostic Workspace Session Continuity (`agy -c`)**:
-  - Automatically queries the global conversation store (`conversation_summaries.db`) to locate the most recently active session for the current working directory, regardless of which account originally created it.
-  - Maps `agy -c` to `--conversation <id>`. The lookup uses a read-only SQLite connection and may fall back to native behavior if the database stays busy or unavailable.
-- **Security Validation & Account Isolation Failover**:
-  - Detects Google Cloud Code account security verification challenges (`VALIDATION_REQUIRED` / 403 `Verify your account to continue`) and auth token revocations.
-  - Automatically isolates restricted accounts to prevent quota deadlocks and immediately fails over generation requests to other healthy accounts (<100ms), keeping interactive sessions uninterrupted.
-  - Provides `agy-pool verify <target>` to launch the dedicated Cloud Code security verification flow in the system browser.
-- **Automatic Log Rotation & Zero-Maintenance Footprint**:
-  - Automatically monitors gateway proxy logs and rotates them via atomic in-place `copytruncate` whenever log size reaches 5 MB (retaining 1 backup, `~/.gemini/agy-pool.log.1`), capping total disk usage under 10 MB.
-  - Built-in `agy-pool log` command supports viewing recent entries (`-n`), following live streams (`-f`), manual truncation (`--clear`), and forced rotation (`--rotate`).
-- **Native User-Agent Preservation**:
-  - Forwards an official `antigravity/cli/...` User-Agent while leaving model availability to the native client and upstream service.
-- **HTTP/1.1 Token Streaming**:
-  - Requests uncompressed upstream responses and relays SSE using valid chunked framing.
-  - If an upstream stream fails after response data is committed, the client receives a truncated/failed response; the request is not replayed on another account.
-- **Pre-Stream Quota & Security Failover**:
-  - HTTP 429, recognized quota-exhaustion HTTP 403, and account security verification challenges retry another healthy account before a response is committed to the client.
-  - Network failures, permission-related 403 responses, and partially emitted streams are not silently replayed.
-- **Cached-Quota Request Load Balancing**:
-  - Generation requests prefer accounts using cached quota, cooldown and request-count data. The daemon refreshes quota about every 180 seconds; `list`, `quota`, and `switch auto` also request a refresh.
-- **One-Click Browser OAuth**:
-  - Automatically triggers the default system browser for Google OAuth sign-in.
-  - Full fallback support for headless terminals and remote SSH sessions via manual authorization code pasting.
-- **Dual Operating Modes**:
-  - **Default Command `agy`**: Automatically wakes the background gateway daemon and enables multi-account load balancing with pre-stream quota failover.
-  - **Direct Command `agy-raw` / `agy-orig`**: Completely bypasses the local proxy and connects 100% directly to Google Cloud Code PA as a failsafe.
-- **Future-Proof & Zero-Invasive Architecture**:
-  - **New Models**: Uses raw payload pass-through and does not maintain a local model allow-list.
-  - **CLI Updates**: Dynamically launches the system's native `agy` binary via `execvpe` and passes arguments through unchanged.
+- **Zero External Dependencies**: Built 100% on the Python 3 standard library (`urllib`, `http.server`, `sqlite3`, `fcntl`). Runs instantly on any Termux or Linux system with no `pip` or wheel compilation.
+- **Intelligent Load Balancing & Fast Failover**: Dynamically routes CLI generation requests based on cached model quotas. Automatically fails over in-flight requests (<100ms) upon hitting HTTP 429 or quota exhaustion, dynamically promoting healthy accounts.
+- **Account-Agnostic Session Continuity (`agy -c`)**: Automatically queries `conversation_summaries.db` to identify the most recent session for the current workspace directory, allowing seamless workflow resumption across different accounts.
+- **Security Isolation & Self-Healing**: Detects Google Cloud Code verification challenges (`VALIDATION_REQUIRED` / 403) and token revocations, isolates restricted accounts to prevent quota deadlocks, and provides one-click browser verification (`agy-pool verify`).
+- **Zero-Maintenance Footprint**: Real-time uncompressed SSE token streaming with official User-Agent preservation, automatic in-place log rotation (`copytruncate` strictly capping log size under 10 MB), and dual-mode fallback (`agy` for load-balanced proxy, `agy-raw` for direct Google connection).
 
 ---
 
 ## Quick Installation
 
 ### Option A: Install from Standalone Tarball (Recommended)
-If you received the standalone `agy-pool-termux.tar.gz` distribution package:
 ```bash
 # Extract into your home directory
 tar -xzvf agy-pool-termux.tar.gz -C ~
@@ -62,49 +36,44 @@ tar -xzvf agy-pool-termux.tar.gz -C ~
 cd ~/agy-pool && bash install.sh
 ```
 
-### Option B: Clone / Install from Source
+### Option B: Clone from Source
 ```bash
 git clone https://github.com/midori01/agy-pool.git ~/agy-pool
 cd ~/agy-pool && bash install.sh
 ```
 
-The installation script will automatically:
-1. Validate the Python 3 runtime and system environment.
-2. Register global system binaries in `$PREFIX/bin` or `/usr/local/bin` (`agy-pool`, `agy-raw`, `agy-orig`).
-3. Configure non-intrusive aliases in `~/.bashrc` (typing `agy` automatically uses the gateway).
-4. Detect and import existing Antigravity login credentials as Account #1.
+The installer automatically validates the Python 3 runtime, installs global symlinks (`agy-pool`, `agy-raw`, `agy-orig`), configures shell aliases, and imports existing Antigravity credentials as Account #1.
 
 ---
 
-## Command Reference
+## Command Cheat Sheet
 
-### 1. Launching Sessions
+### 1. Daily CLI Usage
 
 | Command | Description | Best For |
 | :--- | :--- | :--- |
-| **`agy`** | Launch new session with auto load balancing & failover | **Daily default use** |
-| **`agy -c`** | Resume previous conversation for directory across accounts | Continuing workflows |
-| **`agy-raw`** | Direct connection to Google (bypasses local proxy) | Debugging & network fallback |
+| **`agy`** | Launch session with automatic multi-account load balancing & failover | **Daily default use** |
+| **`agy -c`** | Automatically resume previous session in current workspace across accounts | Continuing ongoing work |
+| **`agy-raw`** | Connect directly to Google Cloud Code (bypasses proxy gateway) | Diagnostics & network fallback |
 | **`agy-orig`** | Alias for `agy-raw` | Same as above |
 
-> **Note**: Native `agy` CLI arguments are passed through unchanged, except `-c` / `--continue`, which is resolved as described above.
+> Native `agy` arguments and options pass through transparently.
 
 ---
 
 ### 2. Account Pool & Quota Management
 
-| Command | Alias / Args | Description |
+| Command | Alias / Parameters | Description |
 | :--- | :--- | :--- |
-| `agy-pool list` | `agy-pool quota` | Refresh when possible, then display cached quota, reset countdowns, and request hits |
-| `agy-pool status` | - | Check gateway status, refresh when possible, and display cached quotas |
+| `agy-pool status` | - | Display gateway daemon status, active account, and cached quotas |
+| `agy-pool quota` | `agy-pool list` | Refresh and display quota progress bars, reset countdowns, and hits |
 | `agy-pool login` | - | Authenticate and add a new Google account via system browser |
-| `agy-pool import-current` | - | Import current `~/.gemini/` credentials into the account pool |
-| `agy-pool switch auto` | - | Switch active account to the one with the highest remaining quota |
-| `agy-pool switch <ID/Email>` | e.g. `agy-pool switch 2` | Manually activate a specific account by index or email |
-| `agy-pool verify [ID/Email]` | e.g. `agy-pool verify 4` | Open Google security verification URL for restricted account in browser |
-| `agy-pool remove <ID/Email>` | e.g. `agy-pool remove 2` | Remove an account from the pool |
+| `agy-pool import-current` | - | Import current active `~/.gemini/` credentials into the pool |
+| `agy-pool switch auto` | - | Switch active account to the one with highest available quota |
+| `agy-pool switch <ID/Email>` | e.g. `switch 2` | Manually designate active account |
+| `agy-pool verify [ID/Email]` | e.g. `verify 3` | Open Google Cloud Code security verification flow in browser |
+| `agy-pool remove <ID/Email>` | e.g. `remove 2` | Remove account from pool |
 
-Quota Dashboard Output Example:
 ```text
 ====================================================================
                  Antigravity Multi-Account Pool
@@ -116,10 +85,6 @@ Quota Dashboard Output Example:
 [2] user2@gmail.com (Bob)     [Idle]  Hits: 9
     • Gemini 5-Hour: [█████████░]  94.9%  (Resets in 3h 45m)
     • Gemini Weekly: [████████░░]  81.3%  (Resets in 3d 19h)
-
-[3] user3@gmail.com (Charlie) [Idle]  Hits: 1
-    • Gemini 5-Hour: [██████████] 100.0%  (Resets in 4h 59m)
-    • Gemini Weekly: [░░░░░░░░░░]   0.0%  (Resets in 3d 12h)
 --------------------------------------------------------------------
 Strategy: max_quota | Gateway Proxy: RUNNING (127.0.0.1:8899)
 ====================================================================
@@ -127,97 +92,50 @@ Strategy: max_quota | Gateway Proxy: RUNNING (127.0.0.1:8899)
 
 ---
 
-### 3. Gateway Daemon Management
-
-The gateway proxy daemon is designed to launch **silently and automatically** in the background whenever you execute `agy`. Manual management commands are also available:
+### 3. Gateway Daemon & Log Management
 
 ```bash
-agy-pool start      # Start gateway proxy daemon in background
-agy-pool stop       # Stop gateway proxy daemon
-agy-pool restart    # Restart gateway proxy daemon
-agy-pool status     # Check daemon PID and listening port
+# Daemon Control (starts automatically on 'agy' if stopped)
+agy-pool start          # Start background gateway daemon
+agy-pool stop           # Stop background gateway daemon
+agy-pool restart        # Restart gateway daemon
+
+# Log Management (auto-rotated at 5 MB, max 10 MB footprint)
+agy-pool log            # View log status and recent proxy entries
+agy-pool log -f         # Follow log in real-time (live stream)
+agy-pool log --rotate   # Force immediate rotation
+agy-pool log --clear    # Truncate active log and clear backups
 ```
 
 ---
 
-### 4. Log Inspection & Rotation Management
+## FAQ & Diagnostics
 
-Gateway traffic is logged in compact format to `~/.gemini/agy-pool.log`. Automatic rotation keeps total log usage strictly under 10 MB:
+### Q1: How do I verify whether my session is routed through the gateway?
+- **Live Logs**: Run `agy-pool log -f` in another tab to observe real-time proxy dispatch.
+- **Hits Counter**: Run `agy-pool status` before and after a prompt to see the request counter increment.
+- **Process Environment**: Inspect `CLOUD_CODE_URL`:
+  ```bash
+  tr '\0' '\n' < /proc/$(pgrep -f "agy" | head -n 1)/environ 2>/dev/null | grep CLOUD_CODE_URL
+  ```
 
-```bash
-agy-pool log            # View log summary and last 20 requests
-agy-pool log -n 50      # View last 50 log entries
-agy-pool log -f         # Follow log in real-time (live streaming tail)
-agy-pool log --rotate   # Force immediate log rotation
-agy-pool log --clear    # Clear/truncate active log and remove backups
-```
-
----
-
-## Verification & Diagnostics (FAQ)
-
-### Q1: How do I verify whether I am currently using the agy-pool gateway?
-
-You can verify gateway usage in 3 ways:
-
-1. **Watch Real-Time Proxy Logs (Most Direct)**:
-   Run `tail -f ~/.gemini/agy-pool.log` in another terminal tab. Sending any prompt in `agy` will immediately emit proxy lines:
-   ```text
-   [2026-09-14 17:38:29] [PROXY] POST streamGenerateContent?alt=sse -> user1@gmail.com (Status: 200)
-   ```
-2. **Check Hits Counter**:
-   Run `agy-pool status`. Sending a prompt will increment the `Hits` count on the dispatched account.
-3. **Inspect Process Environment Variable**:
-   ```bash
-   # Check whether the running agy process is routing through the gateway
-   tr '\0' '\n' < /proc/$(pgrep -f "agy" | head -n 1)/environ 2>/dev/null | grep CLOUD_CODE_URL
-   ```
-   If it outputs `CLOUD_CODE_URL=http://127.0.0.1:8899`, the session is routed through the gateway. If empty, it is in direct raw mode.
-
----
-
-### Q2: Why did the "Gemini 3.8 Flash is no longer available" warning occur previously?
-
-The upstream service uses the client `User-Agent` as part of client-version and model-availability handling. An unrecognized value can produce model availability warnings or fallback behavior.
-
-`agy-pool` preserves an official client User-Agent and dynamically detects the installed `agy` version. Final model availability remains controlled by the native client and upstream service.
-
----
-
-### Q3: Will future agy-cli updates or new Google models break agy-pool?
-
-The proxy does not validate model names and `agy-pool run` passes CLI arguments to the native binary unchanged. Upstream API or authentication changes can still require an `agy-pool` update.
-
-### Q4: Which account state is authoritative during a proxied session?
-
-Each proxied HTTP request uses the account selected by the gateway and its request-level `Authorization` header. The native token file at `~/.gemini/antigravity-cli/antigravity-oauth-token` is compatibility state synchronized when a session starts or an account is explicitly switched. Automatic request failover does not rewrite that global file, so concurrent running sessions cannot churn it on every failover.
+### Q2: Which account state is authoritative during a proxied session?
+Each proxied HTTP request uses the account selected by the gateway and its request-level `Authorization` header. The native token file (`~/.gemini/antigravity-cli/antigravity-oauth-token`) serves as compatibility state synced at session launch and manual account switches. In-flight failovers do not rewrite disk credentials to prevent lock contention across concurrent sessions.
 
 ---
 
 ## Uninstallation
 
-To cleanly remove `agy-pool` and restore original settings:
+To cleanly remove `agy-pool` and restore original environment:
 ```bash
 cd ~/agy-pool && bash uninstall.sh
 ```
-The uninstaller will stop running daemons, remove global symlinks, and remove alias blocks from `~/.bashrc`.
 
 ---
 
 ## Changelog & Versioning
 
-`agy-pool` follows [Semantic Versioning](https://semver.org/). See [CHANGELOG.md](CHANGELOG.md) for detailed release notes across versions.
-
-To check the installed version:
-```bash
-agy-pool --version
-```
-
----
-
-## Autonomous AI Engineering
-
-This entire project—including its repository name (`agy-pool`), system architecture, implementation across all files, test suites, protocol reverse-engineering, log management, and git commit history—was engineered and executed 100% autonomously by AI (**Antigravity**). Not a single line of code was written or edited by a human.
+`agy-pool` follows [Semantic Versioning](https://semver.org/). See [CHANGELOG.md](CHANGELOG.md) for detailed version release notes and feature history.
 
 ---
 
