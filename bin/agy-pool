@@ -1,0 +1,1301 @@
+#!/data/data/com.termux/files/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+agy-pool: Antigravity Multi-Account Pool & Load Balancer for Termux
+Zero-dependency, high portability Google account switcher and quota load balancer.
+"""
+
+import os
+import sys
+import time
+import json
+import socket
+import base64
+import signal
+import platform
+import shutil
+import urllib.request
+import urllib.parse
+import urllib.error
+import http.server
+import socketserver
+import threading
+import subprocess
+import argparse
+from datetime import datetime, timezone
+
+try:
+    import fcntl
+    HAS_FCNTL = True
+except ImportError:
+    HAS_FCNTL = False
+
+# ----------------- Constants & Configuration -----------------
+VERSION = "0.1.0-alpha"
+def _decode_cred(h, k=0x5A):
+    return bytes([b ^ k for b in bytes.fromhex(h)]).decode()
+
+_DEFAULT_CLIENT_ID = _decode_cred("6b6a6d6b6a6a6c6a6c6a6f636b772e3732292933346832686b3639283f68696f2c2e35363530326e3d6e6a693f2a743b2a2a29743d35353d363f2f293f283935342e3f342e74393537")
+_DEFAULT_CLIENT_SECRET = _decode_cred("1d1519090a0277116f621c0d086e626c163e16106b371618622902196e206c2b1e1b3c")
+CLIENT_ID = os.environ.get("AGY_CLIENT_ID", _DEFAULT_CLIENT_ID)
+CLIENT_SECRET = os.environ.get("AGY_CLIENT_SECRET", _DEFAULT_CLIENT_SECRET)
+OAUTH_SCOPES = (
+    "openid email profile "
+    "https://www.googleapis.com/auth/userinfo.email "
+    "https://www.googleapis.com/auth/userinfo.profile "
+    "https://www.googleapis.com/auth/cloud-platform "
+    "https://www.googleapis.com/auth/cclog "
+    "https://www.googleapis.com/auth/experimentsandconfigs "
+    "https://www.googleapis.com/auth/aicode"
+)
+BACKEND_HOST = "daily-cloudcode-pa.googleapis.com"
+BACKEND_URL_BASE = f"https://{BACKEND_HOST}"
+DEFAULT_PORT = 8899
+
+def find_real_agy_binary():
+    """Locate the underlying native agy executable dynamically without self-recursion."""
+    self_path = os.path.abspath(__file__)
+    if os.environ.get("AGY_BIN") and os.path.exists(os.environ["AGY_BIN"]):
+        candidate = os.path.abspath(os.environ["AGY_BIN"])
+        if candidate != self_path:
+            return candidate
+
+    prefix = os.environ.get("PREFIX")
+    candidates = []
+    if prefix:
+        candidates.append(os.path.join(prefix, "bin", "agy"))
+
+    candidates.extend([
+        "/data/data/com.termux/files/usr/bin/agy",
+        "/usr/local/bin/agy",
+        "/usr/bin/agy",
+        os.path.expanduser("~/.local/bin/agy"),
+    ])
+
+    p = shutil.which("agy")
+    if p:
+        candidates.append(p)
+
+    for candidate in candidates:
+        if os.path.exists(candidate):
+            try:
+                if os.path.realpath(candidate) != os.path.realpath(self_path):
+                    return candidate
+            except Exception:
+                return candidate
+    return None
+
+def get_installed_agy_version():
+    agy_bin = find_real_agy_binary()
+    if agy_bin:
+        try:
+            p = subprocess.run([agy_bin, "--version"], capture_output=True, text=True, timeout=2)
+            v = p.stdout.strip()
+            if v and "." in v:
+                return v
+        except Exception:
+            pass
+    return "1.2.2"
+
+INSTALLED_AGY_VER = get_installed_agy_version()
+ARCH = "arm64" if platform.machine() in ["aarch64", "arm64"] else platform.machine()
+OS_TYPE = "linux" if platform.system().lower() == "linux" else platform.system().lower()
+DEFAULT_UA = f"antigravity/cli/{INSTALLED_AGY_VER} (aidev_client; os_type={OS_TYPE}; arch={ARCH}; auth_method=consumer)"
+POOL_LOCK = threading.Lock()
+
+GEMINI_DIR = os.path.expanduser("~/.gemini")
+POOL_CONFIG_FILE = os.path.join(GEMINI_DIR, "agy-pool-accounts.json")
+PID_FILE = os.path.join(GEMINI_DIR, "agy-pool.pid")
+LOG_FILE = os.path.join(GEMINI_DIR, "agy-pool.log")
+AGY_CLI_DIR = os.path.join(GEMINI_DIR, "antigravity-cli")
+AGY_TOKEN_FILE = os.path.join(AGY_CLI_DIR, "antigravity-oauth-token")
+
+# ANSI Color Codes
+CLR_RESET = "\033[0m"
+CLR_BOLD = "\033[1m"
+CLR_DIM = "\033[2m"
+CLR_GREEN = "\033[32m"
+CLR_YELLOW = "\033[33m"
+CLR_BLUE = "\033[34m"
+CLR_MAGENTA = "\033[35m"
+CLR_CYAN = "\033[36m"
+CLR_RED = "\033[31m"
+
+
+def ensure_dirs():
+    os.makedirs(GEMINI_DIR, exist_ok=True)
+    os.makedirs(AGY_CLI_DIR, exist_ok=True)
+
+
+# ----------------- Account Storage -----------------
+def load_pool():
+    with POOL_LOCK:
+        ensure_dirs()
+        if not os.path.exists(POOL_CONFIG_FILE):
+            return {
+                "version": 1,
+                "strategy": "max_quota",  # max_quota | round_robin
+                "active_account_id": None,
+                "accounts": []
+            }
+        try:
+            with open(POOL_CONFIG_FILE, "r", encoding="utf-8") as f:
+                if HAS_FCNTL:
+                    try:
+                        fcntl.flock(f.fileno(), fcntl.LOCK_SH)
+                    except (OSError, IOError):
+                        pass
+                try:
+                    return json.load(f)
+                finally:
+                    if HAS_FCNTL:
+                        try:
+                            fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+                        except (OSError, IOError):
+                            pass
+        except Exception as e:
+            sys.stderr.write(f"{CLR_RED}[Error] Failed to read {POOL_CONFIG_FILE}: {e}{CLR_RESET}\n")
+            return {"version": 1, "strategy": "max_quota", "active_account_id": None, "accounts": []}
+
+
+def save_pool(data):
+    with POOL_LOCK:
+        ensure_dirs()
+        lock_file = POOL_CONFIG_FILE + ".lock"
+        lock_fd = None
+        if HAS_FCNTL:
+            try:
+                lock_fd = os.open(lock_file, os.O_CREAT | os.O_RDWR, 0o600)
+                fcntl.flock(lock_fd, fcntl.LOCK_EX)
+            except (OSError, IOError):
+                lock_fd = None
+        try:
+            tmp_path = POOL_CONFIG_FILE + ".tmp"
+            with open(tmp_path, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2, ensure_ascii=False)
+            os.chmod(tmp_path, 0o600)
+            os.replace(tmp_path, POOL_CONFIG_FILE)
+        finally:
+            if lock_fd is not None:
+                try:
+                    fcntl.flock(lock_fd, fcntl.LOCK_UN)
+                    os.close(lock_fd)
+                except (OSError, IOError):
+                    pass
+
+
+# ----------------- OAuth & Token Utilities -----------------
+def decode_jwt_payload(jwt_str):
+    try:
+        parts = jwt_str.split(".")
+        if len(parts) >= 2:
+            payload_b64 = parts[1] + "=" * ((4 - len(parts[1]) % 4) % 4)
+            return json.loads(base64.urlsafe_b64decode(payload_b64.encode()))
+    except Exception:
+        pass
+    return {}
+
+
+def refresh_token(account):
+    """Refreshes the access token using refresh_token if close to expiry."""
+    now = time.time()
+    exp = account.get("token_expiry", 0)
+    # If valid for at least another 2 minutes, return existing access_token
+    if account.get("access_token") and (exp - now > 120):
+        return account["access_token"]
+
+    rf = account.get("refresh_token")
+    if not rf:
+        raise ValueError("Missing refresh_token")
+
+    params = {
+        "client_id": CLIENT_ID,
+        "client_secret": CLIENT_SECRET,
+        "refresh_token": rf,
+        "grant_type": "refresh_token"
+    }
+    data = urllib.parse.urlencode(params).encode()
+    req = urllib.request.Request("https://oauth2.googleapis.com/token", data=data, method="POST")
+    req.add_header("Content-Type", "application/x-www-form-urlencoded")
+
+    with urllib.request.urlopen(req, timeout=10) as resp:
+        res = json.loads(resp.read().decode())
+
+    new_at = res.get("access_token")
+    new_rf = res.get("refresh_token")
+    expires_in = res.get("expires_in", 3600)
+    if new_at:
+        account["access_token"] = new_at
+        if new_rf:
+            account["refresh_token"] = new_rf
+        account["token_expiry"] = now + expires_in
+        account["updated_at"] = int(now)
+        return new_at
+    raise ValueError("Token refresh failed: No access_token returned")
+
+
+def query_quota(account):
+    """Fetches real-time 5h and weekly quota from Google CloudCode PA API."""
+    at = refresh_token(account)
+    headers = {
+        "Authorization": f"Bearer {at}",
+        "Content-Type": "application/json",
+        "User-Agent": DEFAULT_UA
+    }
+
+    quota_data = {
+        "gemini_5h": {"fraction": 1.0, "reset_time": None},
+        "gemini_weekly": {"fraction": 1.0, "reset_time": None},
+        "third_party_5h": {"fraction": 1.0, "reset_time": None},
+        "third_party_weekly": {"fraction": 1.0, "reset_time": None},
+        "remaining_fraction": 1.0,
+        "reset_time": None,
+        "updated_at": int(time.time())
+    }
+
+    # Primary: retrieveUserQuotaSummary
+    try:
+        req = urllib.request.Request(
+            f"{BACKEND_URL_BASE}/v1internal:retrieveUserQuotaSummary",
+            data=b"{}",
+            headers=headers,
+            method="POST"
+        )
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            res = json.loads(resp.read().decode())
+
+        for group in res.get("groups", []):
+            for b in group.get("buckets", []):
+                bid = b.get("bucketId", "")
+                frac = float(b.get("remainingFraction", 1.0))
+                rt = b.get("resetTime")
+                if "gemini" in bid:
+                    if "5h" in bid or b.get("window") == "5h":
+                        quota_data["gemini_5h"] = {"fraction": frac, "reset_time": rt}
+                    elif "weekly" in bid or b.get("window") == "weekly":
+                        quota_data["gemini_weekly"] = {"fraction": frac, "reset_time": rt}
+                elif "3p" in bid:
+                    if "5h" in bid or b.get("window") == "5h":
+                        quota_data["third_party_5h"] = {"fraction": frac, "reset_time": rt}
+                    elif "weekly" in bid or b.get("window") == "weekly":
+                        quota_data["third_party_weekly"] = {"fraction": frac, "reset_time": rt}
+
+        g5_f = quota_data["gemini_5h"]["fraction"]
+        gw_f = quota_data["gemini_weekly"]["fraction"]
+        quota_data["remaining_fraction"] = min(g5_f, gw_f)
+        quota_data["reset_time"] = quota_data["gemini_5h"]["reset_time"] if g5_f <= gw_f else quota_data["gemini_weekly"]["reset_time"]
+
+    except Exception:
+        # Fallback to fetchAvailableModels
+        try:
+            req = urllib.request.Request(
+                f"{BACKEND_URL_BASE}/v1internal:fetchAvailableModels",
+                data=b"{}",
+                headers=headers,
+                method="POST"
+            )
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                res = json.loads(resp.read().decode())
+            models = res.get("models", {})
+            default_model = res.get("defaultAgentModelId")
+            candidates_m = [default_model] if default_model else []
+            candidates_m += ["gemini-3.8-flash-high", "gemini-3.6-flash-high", "gemini-3.5-flash-medium"]
+            found_quota = False
+            for tm in candidates_m:
+                if tm and tm in models and "quotaInfo" in models[tm]:
+                    qinfo = models[tm]["quotaInfo"]
+                    f = float(qinfo.get("remainingFraction", 1.0))
+                    r = qinfo.get("resetTime")
+                    quota_data["gemini_5h"] = {"fraction": f, "reset_time": r}
+                    quota_data["remaining_fraction"] = f
+                    quota_data["reset_time"] = r
+                    found_quota = True
+                    break
+            if not found_quota:
+                for tm, minfo in models.items():
+                    if isinstance(minfo, dict) and "quotaInfo" in minfo:
+                        qinfo = minfo["quotaInfo"]
+                        f = float(qinfo.get("remainingFraction", 1.0))
+                        r = qinfo.get("resetTime")
+                        quota_data["gemini_5h"] = {"fraction": f, "reset_time": r}
+                        quota_data["remaining_fraction"] = f
+                        quota_data["reset_time"] = r
+                        break
+        except Exception:
+            pass
+
+    account["last_quota"] = quota_data
+    return quota_data
+
+
+def format_remaining_time(iso_reset_time):
+    if not iso_reset_time:
+        return "N/A"
+    try:
+        clean_time = iso_reset_time.replace("Z", "+00:00")
+        target_dt = datetime.fromisoformat(clean_time)
+        now_dt = datetime.now(timezone.utc)
+        diff_sec = int((target_dt - now_dt).total_seconds())
+        if diff_sec <= 0:
+            return "Ready"
+        days, rem = divmod(diff_sec, 86400)
+        hours, rem = divmod(rem, 3600)
+        minutes, _ = divmod(rem, 60)
+        if days > 0:
+            return f"in {days}d {hours}h"
+        if hours > 0:
+            return f"in {hours}h {minutes}m"
+        return f"in {minutes}m"
+    except Exception:
+        return iso_reset_time[:16]
+
+
+def render_progress_bar(fraction, width=10):
+    if fraction is None:
+        fraction = 0.0
+    fraction = max(0.0, min(1.0, float(fraction)))
+    filled = int(round(fraction * width))
+    bar = "█" * filled + "░" * (width - filled)
+    pct = f"{fraction * 100:5.1f}%"
+    if fraction > 0.4:
+        color = CLR_GREEN
+    elif fraction > 0.15:
+        color = CLR_YELLOW
+    else:
+        color = CLR_RED
+    return f"{color}[{bar}] {pct}{CLR_RESET}"
+
+
+# ----------------- Account Login Flow -----------------
+class ThreadedHTTPServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
+    daemon_threads = True
+    allow_reuse_address = True
+    timeout = 5.0
+
+
+class OAuthCallbackHandler(http.server.BaseHTTPRequestHandler):
+    auth_code = None
+    error = None
+    timeout = 5.0
+
+    def do_GET(self):
+        parsed = urllib.parse.urlparse(self.path)
+        if parsed.path.startswith("/auth/callback") or parsed.path == "/":
+            query = urllib.parse.parse_qs(parsed.query)
+            if "code" in query:
+                OAuthCallbackHandler.auth_code = query["code"][0]
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Connection", "close")
+                html = """
+                <html><head><meta name="viewport" content="width=device-width, initial-scale=1.0"></head>
+                <body style="font-family: sans-serif; text-align: center; padding: 40px; background: #0f172a; color: #f8fafc;">
+                    <h2 style="color: #4ade80;">Authorization Successful!</h2>
+                    <p>Antigravity multi-account token has been saved.</p>
+                    <p>You can close this window and return to Termux.</p>
+                </body></html>
+                """
+                body = html.strip().encode("utf-8")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+            elif "error" in query:
+                OAuthCallbackHandler.error = query["error"][0]
+                self.send_response(400)
+                self.send_header("Content-Type", "text/plain; charset=utf-8")
+                self.send_header("Connection", "close")
+                self.end_headers()
+                self.wfile.write(b"Authorization failed.")
+        else:
+            self.send_response(404)
+            self.send_header("Connection", "close")
+            self.end_headers()
+
+    def log_message(self, format, *args):
+        pass
+
+
+def find_free_port(start_port=8085):
+    for p in range(start_port, start_port + 50):
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                s.bind(("127.0.0.1", p))
+                return p
+        except OSError:
+            continue
+    return start_port
+
+
+def do_login():
+    print(f"\n{CLR_BOLD}{CLR_CYAN}=== Antigravity Multi-Account Login ==={CLR_RESET}\n")
+    OAuthCallbackHandler.auth_code = None
+    OAuthCallbackHandler.error = None
+
+    port = find_free_port()
+    redirect_uri = f"http://localhost:{port}/auth/callback"
+
+    params = {
+        "client_id": CLIENT_ID,
+        "redirect_uri": redirect_uri,
+        "response_type": "code",
+        "scope": OAUTH_SCOPES,
+        "access_type": "offline",
+        "prompt": "consent"
+    }
+    auth_url = "https://accounts.google.com/o/oauth2/v2/auth?" + urllib.parse.urlencode(params)
+
+    server = ThreadedHTTPServer(("127.0.0.1", port), OAuthCallbackHandler)
+    server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+    server_thread.start()
+
+    print(f"{CLR_YELLOW}1. Launching browser for Google Authorization...{CLR_RESET}")
+    # Try termux-open-url
+    opened = False
+    for opener in ["termux-open-url", "termux-open", "xdg-open", "open"]:
+        if shutil.which(opener):
+            try:
+                subprocess.Popen([opener, auth_url], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                opened = True
+                break
+            except Exception:
+                pass
+
+    print(f"\n{CLR_DIM}If the browser did not open automatically, copy and open this URL:{CLR_RESET}")
+    print(f"{CLR_BLUE}{auth_url}{CLR_RESET}\n")
+    print(f"{CLR_YELLOW}Waiting for login callback on {redirect_uri}...{CLR_RESET}")
+    print(f"{CLR_DIM}(Or paste the redirect URL / code here if in headless/SSH mode):{CLR_RESET} ", end="", flush=True)
+
+    # Input thread for manual paste fallback
+    manual_input = []
+    def wait_input():
+        try:
+            line = sys.stdin.readline().strip()
+            if line:
+                manual_input.append(line)
+        except Exception:
+            pass
+
+    in_thread = threading.Thread(target=wait_input, daemon=True)
+    in_thread.start()
+
+    code = None
+    start_wait = time.time()
+    while time.time() - start_wait < 180:
+        if OAuthCallbackHandler.auth_code:
+            code = OAuthCallbackHandler.auth_code
+            print(f"\n{CLR_GREEN}✓ Received OAuth callback from browser!{CLR_RESET}")
+            break
+        if manual_input:
+            user_text = manual_input[0]
+            if "code=" in user_text:
+                q = urllib.parse.parse_qs(urllib.parse.urlparse(user_text).query)
+                code = q.get("code", [None])[0]
+            else:
+                code = user_text
+            break
+        time.sleep(0.5)
+
+    def stop_server():
+        try:
+            server.shutdown()
+            server.server_close()
+        except Exception:
+            pass
+
+    threading.Thread(target=stop_server, daemon=True).start()
+
+    if not code:
+        print(f"\n{CLR_RED}[Error] Login timed out or cancelled.{CLR_RESET}")
+        return False
+
+    print(f"{CLR_CYAN}Exchanging code for tokens...{CLR_RESET}")
+    token_params = {
+        "code": code,
+        "client_id": CLIENT_ID,
+        "client_secret": CLIENT_SECRET,
+        "redirect_uri": redirect_uri,
+        "grant_type": "authorization_code"
+    }
+    data = urllib.parse.urlencode(token_params).encode()
+    req = urllib.request.Request("https://oauth2.googleapis.com/token", data=data, method="POST")
+    req.add_header("Content-Type", "application/x-www-form-urlencoded")
+
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            token_res = json.loads(resp.read().decode())
+    except urllib.error.HTTPError as e:
+        print(f"{CLR_RED}[Error] OAuth exchange failed: {e.read().decode()}{CLR_RESET}")
+        return False
+
+    refresh_tok = token_res.get("refresh_token")
+    access_tok = token_res.get("access_token")
+    id_tok = token_res.get("id_token", "")
+    expires_in = token_res.get("expires_in", 3600)
+
+    if not refresh_tok:
+        print(f"{CLR_RED}[Error] Google did not return a refresh_token. Please revole access or re-run with prompt=consent.{CLR_RESET}")
+        return False
+
+    jwt_payload = decode_jwt_payload(id_tok)
+    email = jwt_payload.get("email") or f"user_{int(time.time())}@gmail.com"
+    name = jwt_payload.get("name") or email.split("@")[0]
+
+    pool = load_pool()
+    # Check if account already exists
+    existing = next((acc for acc in pool["accounts"] if acc.get("email") == email), None)
+    if existing:
+        existing["refresh_token"] = refresh_tok
+        existing["access_token"] = access_tok
+        existing["token_expiry"] = time.time() + expires_in
+        existing["id_token"] = id_tok
+        existing["name"] = name
+        account_entry = existing
+        print(f"{CLR_GREEN}✓ Updated existing account: {CLR_BOLD}{email}{CLR_RESET}")
+    else:
+        acc_id = f"acc_{len(pool['accounts']) + 1}"
+        account_entry = {
+            "id": acc_id,
+            "email": email,
+            "name": name,
+            "refresh_token": refresh_tok,
+            "access_token": access_tok,
+            "token_expiry": time.time() + expires_in,
+            "id_token": id_tok,
+            "request_count": 0,
+            "error_count": 0,
+            "created_at": int(time.time()),
+            "last_quota": {}
+        }
+        pool["accounts"].append(account_entry)
+        if not pool.get("active_account_id"):
+            pool["active_account_id"] = acc_id
+        print(f"{CLR_GREEN}✓ Added new account: {CLR_BOLD}{email}{CLR_RESET}")
+
+    # Fetch initial quota
+    print(f"{CLR_CYAN}Probing quota for {email}...{CLR_RESET}")
+    try:
+        q = query_quota(account_entry)
+        g5 = q.get("gemini_5h", {})
+        gw = q.get("gemini_weekly", {})
+        print(f"  • Gemini 5h    : {render_progress_bar(g5.get('fraction', 1.0))} (Resets {format_remaining_time(g5.get('reset_time'))})")
+        print(f"  • Gemini Weekly: {render_progress_bar(gw.get('fraction', 1.0))} (Resets {format_remaining_time(gw.get('reset_time'))})")
+    except Exception as e:
+        print(f"  {CLR_YELLOW}Quota probe warning: {e}{CLR_RESET}")
+
+    save_pool(pool)
+    # Also sync into current agy file if active
+    if pool.get("active_account_id") == account_entry["id"]:
+        write_agy_token_file(account_entry)
+
+    print(f"\n{CLR_GREEN}{CLR_BOLD}Success! Total accounts in pool: {len(pool['accounts'])}{CLR_RESET}\n")
+    return True
+
+
+def import_current():
+    """Imports the current ~/.gemini/antigravity-cli/antigravity-oauth-token into pool."""
+    if not os.path.exists(AGY_TOKEN_FILE):
+        print(f"{CLR_YELLOW}No existing {AGY_TOKEN_FILE} found to import.{CLR_RESET}")
+        return False
+    try:
+        with open(AGY_TOKEN_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        tok = data.get("token", {})
+        rf = tok.get("refresh_token")
+        if not rf:
+            print(f"{CLR_YELLOW}No refresh_token found in existing token file.{CLR_RESET}")
+            return False
+
+        id_tok = data.get("id_token", "")
+        payload = decode_jwt_payload(id_tok)
+        email = payload.get("email") or "primary_user@gmail.com"
+        name = payload.get("name") or email.split("@")[0]
+
+        pool = load_pool()
+        existing = next((acc for acc in pool["accounts"] if acc.get("email") == email), None)
+        if existing:
+            existing["refresh_token"] = rf
+            acc = existing
+        else:
+            acc_id = f"acc_{len(pool['accounts']) + 1}"
+            acc = {
+                "id": acc_id,
+                "email": email,
+                "name": name,
+                "refresh_token": rf,
+                "access_token": tok.get("access_token"),
+                "token_expiry": 0,
+                "id_token": id_tok,
+                "request_count": 0,
+                "error_count": 0,
+                "created_at": int(time.time()),
+                "last_quota": {}
+            }
+            pool["accounts"].append(acc)
+            if not pool.get("active_account_id"):
+                pool["active_account_id"] = acc_id
+
+        try:
+            query_quota(acc)
+        except Exception:
+            pass
+
+        save_pool(pool)
+        print(f"{CLR_GREEN}✓ Successfully imported existing account: {CLR_BOLD}{email}{CLR_RESET}")
+        return True
+    except Exception as e:
+        print(f"{CLR_RED}[Error] Failed to import: {e}{CLR_RESET}")
+        return False
+
+
+def write_agy_token_file(account):
+    """Writes the given account credentials into ~/.gemini/antigravity-cli/antigravity-oauth-token."""
+    ensure_dirs()
+    payload = {
+        "token": {
+            "access_token": account.get("access_token", ""),
+            "token_type": "Bearer",
+            "refresh_token": account.get("refresh_token", ""),
+            "expiry": datetime.fromtimestamp(account.get("token_expiry", time.time() + 3600), timezone.utc).isoformat()
+        },
+        "auth_method": "consumer",
+        "id_token": account.get("id_token", "")
+    }
+    tmp = AGY_TOKEN_FILE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2)
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, AGY_TOKEN_FILE)
+
+
+# ----------------- Quota Display & Account Management -----------------
+def list_accounts():
+    pool = load_pool()
+    accounts = pool.get("accounts", [])
+    if not accounts:
+        print(f"\n{CLR_YELLOW}No accounts in pool yet.{CLR_RESET}")
+        print(f"Run {CLR_BOLD}agy-pool login{CLR_RESET} or {CLR_BOLD}agy-pool import-current{CLR_RESET} to add accounts.\n")
+        return
+
+    print(f"\n{CLR_BOLD}{CLR_CYAN}Fetching real-time quota for {len(accounts)} account(s)...{CLR_RESET}")
+    # Refresh all quotas concurrently
+    threads = []
+    for acc in accounts:
+        t = threading.Thread(target=lambda a: _safe_quota(a), args=(acc,))
+        threads.append(t)
+        t.start()
+    for t in threads:
+        t.join(timeout=8)
+
+    save_pool(pool)
+
+    daemon_running = is_daemon_running()
+    gateway_status = f"{CLR_GREEN}RUNNING (127.0.0.1:{DEFAULT_PORT}){CLR_RESET}" if daemon_running else f"{CLR_DIM}STOPPED{CLR_RESET}"
+
+    sep = "=" * 68
+    sub_sep = "-" * 68
+    print("\n" + sep)
+    title = f"Antigravity Multi-Account Pool v{VERSION}"
+    print(f"{CLR_BOLD}{title:^68}{CLR_RESET}")
+    print(sep)
+
+    active_id = pool.get("active_account_id")
+    for i, acc in enumerate(accounts, start=1):
+        acc_id = acc.get("id", f"acc_{i}")
+        is_active = (acc_id == active_id)
+        email = acc.get("email", "Unknown")
+        name = acc.get("name")
+        q = acc.get("last_quota", {})
+        g5 = q.get("gemini_5h", {})
+        gw = q.get("gemini_weekly", {})
+        tp5 = q.get("third_party_5h", {})
+
+        g5_frac = g5.get("fraction", q.get("remaining_fraction", 1.0))
+        g5_reset = format_remaining_time(g5.get("reset_time", q.get("reset_time")))
+        gw_frac = gw.get("fraction", 1.0)
+        gw_reset = format_remaining_time(gw.get("reset_time"))
+
+        g5_bar = render_progress_bar(g5_frac, width=10)
+        gw_bar = render_progress_bar(gw_frac, width=10)
+
+        hits = acc.get("request_count", 0)
+        marker = f"{CLR_GREEN}* Active{CLR_RESET}" if is_active else f"{CLR_DIM}Idle{CLR_RESET}"
+        name_str = f" ({name})" if name and name != email else ""
+
+        print(f"{CLR_BOLD}[{i}] {email}{name_str}{CLR_RESET}  [{marker}]  Hits: {hits}")
+        print(f"    • Gemini 5-Hour: {g5_bar}  (Resets {g5_reset})")
+        print(f"    • Gemini Weekly: {gw_bar}  (Resets {gw_reset})")
+
+        if tp5 and tp5.get("fraction") is not None and tp5.get("fraction") < 1.0:
+            tp_bar = render_progress_bar(tp5.get("fraction"), width=10)
+            tp_reset = format_remaining_time(tp5.get("reset_time"))
+            print(f"    • Claude/GPT 5h: {tp_bar}  (Resets {tp_reset})")
+
+        if i < len(accounts):
+            print()
+
+    print(sub_sep)
+    print(f"Strategy: {CLR_BOLD}{pool.get('strategy', 'max_quota')}{CLR_RESET} | Gateway Proxy: {gateway_status}")
+    print(sep + "\n")
+
+
+def _safe_quota(account):
+    try:
+        query_quota(account)
+    except Exception:
+        pass
+
+
+def remove_account(target):
+    pool = load_pool()
+    accounts = pool.get("accounts", [])
+    found = None
+    if target.isdigit():
+        idx = int(target) - 1
+        if 0 <= idx < len(accounts):
+            found = accounts[idx]
+    else:
+        found = next((a for a in accounts if a.get("id") == target or a.get("email") == target), None)
+
+    if not found:
+        print(f"{CLR_RED}[Error] Account '{target}' not found.{CLR_RESET}")
+        return False
+
+    pool["accounts"] = [a for a in accounts if a != found]
+    if pool.get("active_account_id") == found.get("id"):
+        pool["active_account_id"] = pool["accounts"][0]["id"] if pool["accounts"] else None
+    save_pool(pool)
+    print(f"{CLR_GREEN}✓ Removed account: {found.get('email')}{CLR_RESET}")
+    return True
+
+
+def switch_account(target=None, silent=False):
+    pool = load_pool()
+    accounts = pool.get("accounts", [])
+    if not accounts:
+        if not silent:
+            print(f"{CLR_RED}[Error] Account pool is empty.{CLR_RESET}")
+        return False
+
+    selected = None
+    if target is None or target == "auto":
+        # Find highest remaining fraction
+        if not silent:
+            print(f"{CLR_CYAN}Auto-selecting account with highest quota...{CLR_RESET}")
+        for acc in accounts:
+            _safe_quota(acc)
+        save_pool(pool)
+        accounts.sort(key=lambda x: x.get("last_quota", {}).get("remaining_fraction", 0.0), reverse=True)
+        selected = accounts[0]
+    elif target.isdigit():
+        idx = int(target) - 1
+        if 0 <= idx < len(accounts):
+            selected = accounts[idx]
+    else:
+        selected = next((a for a in accounts if a.get("id") == target or a.get("email") == target), None)
+
+    if not selected:
+        if not silent:
+            print(f"{CLR_RED}[Error] Account '{target}' not found.{CLR_RESET}")
+        return False
+
+    pool["active_account_id"] = selected["id"]
+    try:
+        refresh_token(selected)
+    except Exception:
+        pass
+    save_pool(pool)
+    write_agy_token_file(selected)
+    q = selected.get("last_quota", {})
+    g5 = q.get("gemini_5h", {})
+    gw = q.get("gemini_weekly", {})
+    g5_frac = g5.get("fraction", q.get("remaining_fraction", 1.0))
+    gw_frac = gw.get("fraction", 1.0)
+    if not silent:
+        print(f"{CLR_GREEN}✓ Active account switched to: {CLR_BOLD}{selected.get('email')}{CLR_RESET}")
+        print(f"  • Gemini 5h    : {render_progress_bar(g5_frac)} (Resets {format_remaining_time(g5.get('reset_time'))})")
+        print(f"  • Gemini Weekly: {render_progress_bar(gw_frac)} (Resets {format_remaining_time(gw.get('reset_time'))})")
+    return True
+
+
+# ----------------- Smart Reverse Proxy Gateway -----------------
+class SmartProxyHandler(http.server.BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+
+    def do_GET(self):
+        self.handle_proxy()
+
+    def do_POST(self):
+        self.handle_proxy()
+
+    def handle_proxy(self):
+        path = self.path
+        body = b""
+        content_length = self.headers.get("Content-Length")
+        transfer_encoding = self.headers.get("Transfer-Encoding", "").lower()
+
+        if content_length:
+            try:
+                body = self.rfile.read(int(content_length))
+            except Exception:
+                pass
+        elif "chunked" in transfer_encoding:
+            try:
+                chunks = []
+                while True:
+                    line = self.rfile.readline()
+                    if not line:
+                        break
+                    chunk_len_str = line.split(b";")[0].strip()
+                    if not chunk_len_str:
+                        continue
+                    chunk_len = int(chunk_len_str, 16)
+                    if chunk_len == 0:
+                        while True:
+                            tline = self.rfile.readline()
+                            if not tline or tline in (b"\r\n", b"\n", b""):
+                                break
+                        break
+                    chunk_data = self.rfile.read(chunk_len)
+                    chunks.append(chunk_data)
+                    self.rfile.readline()  # trailing \r\n
+                body = b"".join(chunks)
+            except Exception:
+                pass
+
+        # Determine if this is a streaming/generation request
+        is_generation = ("generatecontent" in path.lower())
+        is_sse = is_generation or ("stream" in path.lower()) or ("text/event-stream" in str(self.headers.get("Accept", "")).lower())
+
+        pool = load_pool()
+        accounts = pool.get("accounts", [])
+        if not accounts:
+            try:
+                self.send_error(503, "No accounts configured in agy-pool")
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+            return
+
+        # Selection strategy
+        candidates = list(accounts)
+        now = time.time()
+
+        if is_generation:
+            # Sort candidates: healthy quota first, lowest request hits to distribute load
+            def sort_key(acc):
+                if acc.get("rate_limited_until", 0) > now:
+                    return (-1, 0.0, 0)
+                q = acc.get("last_quota", {})
+                raw_f = q.get("remaining_fraction")
+                try:
+                    f = float(raw_f) if raw_f is not None else 1.0
+                except (ValueError, TypeError):
+                    f = 1.0
+                if f <= 0.005:
+                    return (0, f, -acc.get("request_count", 0))
+                return (1, round(f, 2), -acc.get("request_count", 0))
+
+            candidates.sort(key=sort_key, reverse=True)
+        else:
+            # Non-generation: use active account if available
+            active_id = pool.get("active_account_id")
+            candidates.sort(key=lambda a: 0 if a.get("id") == active_id else 1)
+
+        # Forward with failover retry loop
+        last_error = None
+        client_ua = self.headers.get("User-Agent", "")
+        if not client_ua.startswith("antigravity/"):
+            client_ua = DEFAULT_UA
+
+        for acc in candidates:
+            try:
+                at = refresh_token(acc)
+            except Exception as e:
+                continue
+
+            target_url = f"{BACKEND_URL_BASE}{path}"
+            headers = {}
+            for k, v in self.headers.items():
+                k_lower = k.lower()
+                # Strip hop-by-hop and encoding headers
+                if k_lower in ["host", "content-length", "authorization", "accept-encoding", "transfer-encoding", "connection", "keep-alive"]:
+                    continue
+                headers[k] = v
+            headers["Host"] = BACKEND_HOST
+            headers["Authorization"] = f"Bearer {at}"
+            headers["User-Agent"] = client_ua
+
+            if self.command == "POST" and len(body) == 0:
+                headers["Content-Length"] = "0"
+                req_data = b""
+            else:
+                req_data = body if body else None
+
+            req = urllib.request.Request(target_url, data=req_data, headers=headers, method=self.command)
+
+            try:
+                with urllib.request.urlopen(req, timeout=300) as resp:
+                    status = resp.status
+                    acc["request_count"] = acc.get("request_count", 0) + 1
+                    active_id = pool.get("active_account_id")
+                    active_acc = next((a for a in accounts if a.get("id") == active_id), None)
+                    if (not active_id) or (active_acc and active_acc.get("rate_limited_until", 0) > time.time() and acc.get("id") != active_acc.get("id")):
+                        pool["active_account_id"] = acc["id"]
+                        try:
+                            write_agy_token_file(acc)
+                        except Exception:
+                            pass
+                    save_pool(pool)
+                    sys.stderr.write(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [PROXY] {self.command} {path.split('/')[-1]} -> {acc.get('email')} (Status: {status})\n")
+                    sys.stderr.flush()
+
+                    resp_content_type = str(resp.headers.get("Content-Type", "")).lower()
+                    is_stream = is_sse or ("text/event-stream" in resp_content_type)
+
+                    if is_stream:
+                        # Chunked streaming for generate content & SSE
+                        self.send_response(status)
+                        for hk, hv in resp.getheaders():
+                            if hk.lower() not in ["transfer-encoding", "content-length", "connection", "keep-alive", "content-encoding"]:
+                                self.send_header(hk, hv)
+                        self.send_header("Transfer-Encoding", "chunked")
+                        self.send_header("Connection", "keep-alive")
+                        self.end_headers()
+
+                        try:
+                            while True:
+                                chunk = resp.read1(4096) if hasattr(resp, "read1") else resp.read(1024)
+                                if not chunk:
+                                    break
+                                self.wfile.write(f"{len(chunk):X}\r\n".encode() + chunk + b"\r\n")
+                                self.wfile.flush()
+                            self.wfile.write(b"0\r\n\r\n")
+                            self.wfile.flush()
+                        except (BrokenPipeError, ConnectionResetError):
+                            pass
+                    else:
+                        # Non-streaming unary RPC: buffer and send Content-Length
+                        resp_body = resp.read()
+                        self.send_response(status)
+                        for hk, hv in resp.getheaders():
+                            if hk.lower() not in ["transfer-encoding", "content-length", "connection", "keep-alive", "content-encoding"]:
+                                self.send_header(hk, hv)
+                        self.send_header("Content-Length", str(len(resp_body)))
+                        self.send_header("Connection", "keep-alive")
+                        self.end_headers()
+                        try:
+                            self.wfile.write(resp_body)
+                            self.wfile.flush()
+                        except (BrokenPipeError, ConnectionResetError):
+                            pass
+                    return
+
+            except urllib.error.HTTPError as e:
+                last_error = e
+                err_body = b""
+                try:
+                    err_body = e.read()
+                except Exception:
+                    pass
+                sys.stderr.write(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [PROXY ERROR] {self.command} {path.split('/')[-1]} -> {acc.get('email')} HTTP {e.code}: {err_body[:200].decode(errors='replace')}\n")
+                sys.stderr.flush()
+                # Failover on 429 (ResourceExhausted / Quota Exceeded) or 403 quota exhaustion
+                is_quota_err = (e.code == 429) or (e.code == 403 and any(x in err_body.lower() for x in [b"resource_exhausted", b"quota_exceeded", b"quota"]))
+                if is_quota_err:
+                    failover_time = time.time()
+                    acc["rate_limited_until"] = failover_time + 300
+                    acc["error_count"] = acc.get("error_count", 0) + 1
+                    save_pool(pool)
+                    sys.stderr.write(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [FAILOVER] Account {acc.get('email')} hit rate limit/quota error! Auto-switching to next account...\n")
+                    sys.stderr.flush()
+                    continue
+                else:
+                    try:
+                        self.send_response(e.code)
+                        for hk, hv in e.headers.items():
+                            if hk.lower() not in ["transfer-encoding", "content-length", "connection", "keep-alive", "content-encoding"]:
+                                self.send_header(hk, hv)
+                        self.send_header("Content-Length", str(len(err_body)))
+                        self.send_header("Connection", "keep-alive")
+                        self.end_headers()
+                        self.wfile.write(err_body)
+                        self.wfile.flush()
+                    except (BrokenPipeError, ConnectionResetError):
+                        pass
+                    return
+
+            except (BrokenPipeError, ConnectionResetError):
+                return
+            except Exception as e:
+                last_error = e
+                sys.stderr.write(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [PROXY EXCEPTION] {self.command} {path.split('/')[-1]} -> {acc.get('email')}: {e}\n")
+                sys.stderr.flush()
+                continue
+
+        # If all candidates exhausted
+        sys.stderr.write(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [ALL EXHAUSTED] {self.command} {path.split('/')[-1]} failed across all accounts: {last_error}\n")
+        sys.stderr.flush()
+        try:
+            self.send_error(503, f"All accounts in pool exhausted or unavailable: {last_error}")
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+
+    def log_message(self, format, *args):
+        pass
+
+
+
+def start_proxy_daemon(foreground=False):
+    if not foreground and is_daemon_running():
+        print(f"{CLR_YELLOW}Proxy daemon is already running (PID: {get_daemon_pid()}).{CLR_RESET}")
+        return
+
+    if not foreground:
+        # Launch background process
+        cmd = [sys.executable, os.path.abspath(__file__), "daemon-run"]
+        with open(LOG_FILE, "a") as logf:
+            p = subprocess.Popen(cmd, stdout=logf, stderr=logf, start_new_session=True)
+        with open(PID_FILE, "w") as f:
+            f.write(str(p.pid))
+        time.sleep(1)
+        if is_daemon_running():
+            print(f"{CLR_GREEN}✓ Antigravity load balancer gateway started on http://127.0.0.1:{DEFAULT_PORT} (PID: {p.pid}){CLR_RESET}")
+        else:
+            print(f"{CLR_RED}[Error] Failed to start gateway. Check {LOG_FILE}{CLR_RESET}")
+        return
+
+    # Foreground runner
+    with open(PID_FILE, "w") as f:
+        f.write(str(os.getpid()))
+
+    def cleanup(signum, frame):
+        if os.path.exists(PID_FILE):
+            try:
+                os.remove(PID_FILE)
+            except Exception:
+                pass
+        sys.exit(0)
+
+    signal.signal(signal.SIGTERM, cleanup)
+    signal.signal(signal.SIGINT, cleanup)
+
+    # Background periodic quota refresher
+    def background_refresher():
+        while True:
+            time.sleep(180)
+            try:
+                pool = load_pool()
+                for acc in pool.get("accounts", []):
+                    _safe_quota(acc)
+                save_pool(pool)
+            except Exception:
+                pass
+
+    t = threading.Thread(target=background_refresher, daemon=True)
+    t.start()
+
+    server = ThreadedHTTPServer(("127.0.0.1", DEFAULT_PORT), SmartProxyHandler)
+    try:
+        server.serve_forever()
+    finally:
+        cleanup(None, None)
+
+
+def stop_proxy_daemon():
+    pid = get_daemon_pid()
+    if not pid:
+        print(f"{CLR_YELLOW}Proxy daemon is not running.{CLR_RESET}")
+        return
+    try:
+        os.kill(pid, signal.SIGTERM)
+        time.sleep(0.5)
+        print(f"{CLR_GREEN}✓ Proxy daemon (PID: {pid}) stopped.{CLR_RESET}")
+    except ProcessLookupError:
+        print(f"{CLR_YELLOW}Process {pid} already dead.{CLR_RESET}")
+    except Exception as e:
+        print(f"{CLR_RED}[Error] Failed to stop daemon: {e}{CLR_RESET}")
+    finally:
+        if os.path.exists(PID_FILE):
+            os.remove(PID_FILE)
+
+
+def get_daemon_pid():
+    if not os.path.exists(PID_FILE):
+        return None
+    try:
+        with open(PID_FILE, "r") as f:
+            pid = int(f.read().strip())
+        os.kill(pid, 0)
+        cmdline_path = f"/proc/{pid}/cmdline"
+        if os.path.exists(cmdline_path):
+            with open(cmdline_path, "rb") as f:
+                cmd = f.read().decode(errors="ignore")
+                if "agy-pool" not in cmd:
+                    return None
+        return pid
+    except Exception:
+        return None
+
+
+def is_port_listening(port=DEFAULT_PORT):
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.settimeout(0.3)
+        return s.connect_ex(("127.0.0.1", port)) == 0
+
+
+def is_daemon_running():
+    pid = get_daemon_pid()
+    if not pid:
+        return False
+    return is_port_listening()
+
+
+# ----------------- CLI Wrappers -----------------
+def run_agy_with_lb(extra_args):
+    """Ensures LB daemon is running and executes agy with dynamic load balancing."""
+    if not is_daemon_running():
+        start_proxy_daemon(foreground=False)
+
+    pool = load_pool()
+    accounts = pool.get("accounts", [])
+    active_id = pool.get("active_account_id")
+    active_acc = next((a for a in accounts if a.get("id") == active_id), None)
+
+    email = active_acc.get("email", "none") if active_acc else "none"
+
+    env = os.environ.copy()
+    env["CLOUD_CODE_URL"] = f"http://127.0.0.1:{DEFAULT_PORT}"
+
+    # Sync token file with active account (ensure fresh access token)
+    if active_acc:
+        try:
+            refresh_token(active_acc)
+            save_pool(pool)
+        except Exception:
+            pass
+        write_agy_token_file(active_acc)
+
+    # Locate real agy binary
+    agy_path = find_real_agy_binary()
+    if not agy_path:
+        print(f"{CLR_RED}[Error] Could not locate 'agy' executable in PATH.{CLR_RESET}")
+        sys.exit(1)
+
+    cmd = [agy_path] + extra_args
+    try:
+        os.execvpe(agy_path, cmd, env)
+    except Exception as e:
+        print(f"{CLR_RED}[Error] Failed to execute agy: {e}{CLR_RESET}")
+        sys.exit(1)
+
+
+def run_agy_direct(extra_args):
+    """Executes original native agy directly without proxy gateway."""
+    env = os.environ.copy()
+    env.pop("CLOUD_CODE_URL", None)
+
+    agy_path = find_real_agy_binary()
+    if not agy_path:
+        print(f"{CLR_RED}[Error] Could not locate 'agy' executable in PATH.{CLR_RESET}")
+        sys.exit(1)
+
+    cmd = [agy_path] + extra_args
+    try:
+        os.execvpe(agy_path, cmd, env)
+    except Exception as e:
+        print(f"{CLR_RED}[Error] Failed to execute agy: {e}{CLR_RESET}")
+        sys.exit(1)
+
+
+# ----------------- Main Entrypoint -----------------
+def main():
+    # Fast dispatch for CLI run / direct commands preserving exact args
+    if len(sys.argv) > 1:
+        if sys.argv[1] == "run":
+            run_agy_with_lb(sys.argv[2:])
+            return
+        elif sys.argv[1] in ["raw", "orig", "direct"]:
+            run_agy_direct(sys.argv[2:])
+            return
+        elif sys.argv[1] in ["-v", "--version", "version"]:
+            print(f"agy-pool {VERSION}")
+            return
+    parser = argparse.ArgumentParser(
+        prog="agy-pool",
+        description="Antigravity Multi-Account Pool & Load Balancer for Termux",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""Examples:
+  agy-pool login            Add/login a new Google account
+  agy-pool list             Show all accounts and real-time quotas
+  agy-pool switch auto      Switch active account to the one with highest quota
+  agy-pool start            Start the load balancing reverse proxy daemon
+  agy-pool run              Launch agy with automated quota load balancing
+"""
+    )
+    parser.add_argument("-v", "--version", action="version", version=f"agy-pool {VERSION}")
+
+    subparsers = parser.add_subparsers(dest="command")
+
+    # login / add
+    subparsers.add_parser("login", aliases=["add"], help="Login and add a Google account to the pool")
+    # import-current
+    subparsers.add_parser("import-current", help="Import current account from existing antigravity token")
+    # list / quota / status
+    subparsers.add_parser("list", aliases=["ls", "quota"], help="List accounts and display quota dashboard")
+    # remove
+    rm_p = subparsers.add_parser("remove", aliases=["rm"], help="Remove an account by index or email")
+    rm_p.add_argument("target", help="Account index or email")
+    # switch
+    sw_p = subparsers.add_parser("switch", help="Switch current active account (auto or index/email)")
+    sw_p.add_argument("target", nargs="?", default="auto", help="Account index, email, or 'auto'")
+    # daemon control
+    subparsers.add_parser("start", help="Start background load balancer proxy daemon")
+    subparsers.add_parser("stop", help="Stop background load balancer proxy daemon")
+    subparsers.add_parser("restart", help="Restart background load balancer proxy daemon")
+    subparsers.add_parser("status", help="Check status of proxy daemon and pool")
+    subparsers.add_parser("daemon-run", help=argparse.SUPPRESS)  # Internal daemon worker
+    # run wrapper
+    run_p = subparsers.add_parser("run", help="Run agy through the load balancer")
+    run_p.add_argument("args", nargs=argparse.REMAINDER, help="Arguments to pass to agy")
+
+    args, unknown = parser.parse_known_args()
+
+    cmd = args.command
+    if not cmd:
+        list_accounts()
+        return
+
+    if cmd in ["login", "add"]:
+        do_login()
+    elif cmd == "import-current":
+        import_current()
+    elif cmd in ["list", "ls", "quota"]:
+        list_accounts()
+    elif cmd in ["remove", "rm"]:
+        remove_account(args.target)
+    elif cmd == "switch":
+        switch_account(args.target)
+    elif cmd == "start":
+        start_proxy_daemon(foreground=False)
+    elif cmd == "stop":
+        stop_proxy_daemon()
+    elif cmd == "restart":
+        stop_proxy_daemon()
+        time.sleep(1)
+        start_proxy_daemon(foreground=False)
+    elif cmd == "status":
+        pid = get_daemon_pid()
+        if pid:
+            print(f"{CLR_GREEN}✓ Gateway Proxy is RUNNING (PID: {pid}) on http://127.0.0.1:{DEFAULT_PORT}{CLR_RESET}")
+        else:
+            print(f"{CLR_YELLOW}○ Gateway Proxy is STOPPED{CLR_RESET}")
+        list_accounts()
+    elif cmd == "daemon-run":
+        start_proxy_daemon(foreground=True)
+    elif cmd == "run":
+        all_args = (args.args or []) + unknown
+        run_agy_with_lb(all_args)
+
+
+if __name__ == "__main__":
+    main()

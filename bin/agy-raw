@@ -1,0 +1,29 @@
+#!/data/data/com.termux/files/usr/bin/env bash
+# agy-raw: Directly execute original native Antigravity CLI without proxy gateway
+unset CLOUD_CODE_URL
+
+SELF="$(realpath "$0" 2>/dev/null || readlink -f "$0" 2>/dev/null || echo "$0")"
+
+REAL_AGY="${AGY_BIN:-}"
+if [ -n "$REAL_AGY" ] && [ -x "$REAL_AGY" ]; then
+    exec "$REAL_AGY" "$@"
+fi
+
+# Dynamically locate the original agy binary without hardcoding internal paths
+for cand in \
+    "${PREFIX:+${PREFIX}/bin/agy}" \
+    "/data/data/com.termux/files/usr/bin/agy" \
+    "/usr/local/bin/agy" \
+    "/usr/bin/agy" \
+    "$HOME/.local/bin/agy" \
+    "$(type -P agy 2>/dev/null || true)"; do
+    if [ -n "$cand" ] && [ -x "$cand" ]; then
+        cand_real="$(realpath "$cand" 2>/dev/null || readlink -f "$cand" 2>/dev/null || echo "$cand")"
+        if [ "$cand_real" != "$SELF" ]; then
+            exec "$cand" "$@"
+        fi
+    fi
+done
+
+echo "[Error] Could not locate native 'agy' executable in PATH." >&2
+exit 1

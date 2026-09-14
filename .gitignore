@@ -1,0 +1,18 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Runtime & daemon files
+*.pid
+*.log
+*.tmp
+*.lock
+
+# Distribution packages
+*.tar.gz
+*.zip
+
+# Local user configurations / sensitive credentials
+agy-pool-accounts.json
+antigravity-oauth-token

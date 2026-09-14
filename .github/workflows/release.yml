@@ -1,0 +1,68 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Build distribution package
+        run: |
+          mkdir -p dist
+          # Package repository archive with top-level folder 'agy-pool'
+          cd ..
+          tar --exclude='.git' \
+              --exclude='agy-pool/dist' \
+              --exclude='agy-pool/.github' \
+              --exclude='agy-pool/__pycache__' \
+              --exclude='*.pyc' \
+              -czvf agy-pool/dist/agy-pool-termux.tar.gz agy-pool
+          cd agy-pool
+          ls -lh dist/
+
+      - name: Extract Changelog entry
+        id: changelog
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          echo "Extracting release notes for version: $VERSION"
+          python3 -c "
+          import re, sys
+          tag = sys.argv[1]
+          with open('CHANGELOG.md', 'r', encoding='utf-8') as f:
+              content = f.read()
+          pattern = rf'## \[{re.escape(tag)}\][^\n]*\n(.*?)(?=\n## \[|\Z)'
+          match = re.search(pattern, content, re.DOTALL)
+          notes = match.group(1).strip() if match else 'Release ' + tag
+          with open('release_notes.md', 'w', encoding='utf-8') as out:
+              out.write(notes + '\n')
+          " "$VERSION"
+          cat release_notes.md
+
+      - name: Determine prerelease status
+        id: check-prerelease
+        run: |
+          if [[ "${GITHUB_REF_NAME}" =~ (alpha|beta|rc) ]]; then
+            echo "prerelease=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "prerelease=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: "agy-pool ${{ github.ref_name }}"
+          body_path: release_notes.md
+          prerelease: ${{ steps.check-prerelease.outputs.prerelease }}
+          files: |
+            dist/agy-pool-termux.tar.gz
