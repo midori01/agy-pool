@@ -10,20 +10,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 - **Account-Agnostic Workspace Session Continuity (`agy -c`)**:
   - Automatically queries `~/.gemini/antigravity-cli/conversation_summaries.db` to locate the true latest conversation for the current workspace directory (with hierarchical parent-directory walk-up support).
-  - Resolves `-c` / `--continue` directly into `--conversation <cid>`, guaranteeing that switching Google accounts or changing active account never fragments or creates new conversations in the same directory.
-  - Detects active process presence locks to prevent race conditions across parallel terminal windows.
+  - Resolves `-c` / `--continue` directly into `--conversation <cid>` when a matching record is available.
+  - Detects active process presence locks and warns about parallel use.
 
 ## [0.1.0-alpha] - 2026-09-14
 
 ### Added
 - **Intelligent Quota Load Balancer Gateway**: Zero-dependency reverse proxy daemon (`http://127.0.0.1:8899`) distributing CLI requests across multiple Google accounts.
-- **Sub-100ms In-Flight 429 Failover**: Seamlessly intercepts HTTP 429 (ResourceExhausted) or quota limit errors during model generation and retries with healthy accounts under 100ms without crashing sessions.
+- **Pre-Stream 429 Failover**: Intercepts HTTP 429 (ResourceExhausted) or recognized quota errors before response commit and retries with a healthy account.
 - **Active Account Auto-Promotion**: Promotes succeeding failover accounts as the primary active account to avoid redundant failover overhead on future turns.
-- **Real-Time Token Streaming**: Pass-through of Server-Sent Events (`/v1internal:streamGenerateContent?alt=sse`) and HTTP/1.1 chunked transfer encoding, with upstream Gzip stripping to eliminate typewriter token delays.
-- **Dynamic Full-Catalog Model Support**: Dynamically aligns official client User-Agent strings (`antigravity/cli/...`) to unlock Google's entire Cloud Code model catalog (e.g. `gemini-3.8-flash-high`) without downgrade warnings.
-- **Process-Level Concurrency Protection**: Integrated `fcntl.flock` file locking to guarantee ACID atomic JSON configuration updates and prevent race conditions between background daemon and foreground CLI.
+- **Token Streaming**: Pass-through of Server-Sent Events (`/v1internal:streamGenerateContent?alt=sse`) using HTTP/1.1 chunked transfer encoding and uncompressed upstream requests.
+- **Native User-Agent Preservation**: Preserves an official `antigravity/cli/...` User-Agent while leaving model availability to the native client and upstream service.
+- **Process-Level Concurrency Protection**: Uses `fcntl.flock` around pool-state access.
 - **Multi-Account OAuth Management**: One-click system browser authentication (`termux-open-url`, `termux-open`, `xdg-open`, `open`) with headless fallback for manual code pasting in SSH/remote environments.
-- **Visual Terminal Dashboard**: Real-time quota progress bars for Gemini 5-hour, weekly, and third-party models with reset countdown timers (`agy-pool quota` / `agy-pool list`).
+- **Visual Terminal Dashboard**: Cached quota progress bars for Gemini 5-hour, weekly, and third-party models with reset countdown timers (`agy-pool quota` / `agy-pool list`).
 - **Direct Native Fallback Mode**: `agy-raw` / `agy-orig` scripts to bypass the gateway proxy whenever direct connection to Google is required.
 - **CLI Commands Suite**: Complete control commands for `login`, `import-current`, `list`/`quota`, `switch`, `remove`, `start`, `stop`, `restart`, `status`, and `-v`/`--version`.
 - **Packaging & Portability**: Automated Termux/Linux installer (`install.sh`), uninstaller (`uninstall.sh`), and standalone distribution archive.
