@@ -1,6 +1,6 @@
 # agy-pool: Antigravity Multi-Account Quota Pool & Intelligent Load Balancer Suite
 
-[![Version](https://img.shields.io/badge/version-0.1.0--alpha4-blue.svg)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-0.1.0--alpha5-blue.svg)](CHANGELOG.md)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Platform](https://img.shields.io/badge/platform-Termux%20%7C%20Linux%20%7C%20macOS-green.svg)](#)
 [![Python: 3.8+](https://img.shields.io/badge/python-3.8+-blue.svg)](#)
@@ -20,6 +20,9 @@ A zero-dependency multi-account quota pool and local reverse proxy for **Antigra
   - Detects Google Cloud Code account security verification challenges (`VALIDATION_REQUIRED` / 403 `Verify your account to continue`) and auth token revocations.
   - Automatically isolates restricted accounts to prevent quota deadlocks and immediately fails over generation requests to other healthy accounts (<100ms), keeping interactive sessions uninterrupted.
   - Provides `agy-pool verify <target>` to launch the dedicated Cloud Code security verification flow in the system browser.
+- **Automatic Log Rotation & Zero-Maintenance Footprint**:
+  - Automatically monitors gateway proxy logs and rotates them via atomic in-place `copytruncate` whenever log size reaches 5 MB (retaining 1 backup, `~/.gemini/agy-pool.log.1`), capping total disk usage under 10 MB.
+  - Built-in `agy-pool log` command supports viewing recent entries (`-n`), following live streams (`-f`), manual truncation (`--clear`), and forced rotation (`--rotate`).
 - **Native User-Agent Preservation**:
   - Forwards an official `antigravity/cli/...` User-Agent while leaving model availability to the native client and upstream service.
 - **HTTP/1.1 Token Streaming**:
@@ -128,6 +131,20 @@ agy-pool start      # Start gateway proxy daemon in background
 agy-pool stop       # Stop gateway proxy daemon
 agy-pool restart    # Restart gateway proxy daemon
 agy-pool status     # Check daemon PID and listening port
+```
+
+---
+
+### 4. Log Inspection & Rotation Management
+
+Gateway traffic is logged in compact format to `~/.gemini/agy-pool.log`. Automatic rotation keeps total log usage strictly under 10 MB:
+
+```bash
+agy-pool log            # View log summary and last 20 requests
+agy-pool log -n 50      # View last 50 log entries
+agy-pool log -f         # Follow log in real-time (live streaming tail)
+agy-pool log --rotate   # Force immediate log rotation
+agy-pool log --clear    # Clear/truncate active log and remove backups
 ```
 
 ---

@@ -627,6 +627,68 @@ class AgyPoolTest(unittest.TestCase):
             pool = agy_pool.load_pool()
             self.assertIsNone(pool["accounts"][0].get("status"))
 
+    def test_rotate_log_if_needed_threshold(self):
+        log_path = os.path.join(self.temp.name, "test.log")
+        with open(log_path, "wb") as f:
+            f.write(b"x" * 1000)
+
+        # Below threshold: no rotation
+        rotated = agy_pool.rotate_log_if_needed(log_path, max_bytes=2000, backup_count=1)
+        self.assertFalse(rotated)
+        self.assertEqual(os.path.getsize(log_path), 1000)
+        self.assertFalse(os.path.exists(log_path + ".1"))
+
+        # Above threshold: rotate
+        rotated = agy_pool.rotate_log_if_needed(log_path, max_bytes=500, backup_count=1)
+        self.assertTrue(rotated)
+        self.assertEqual(os.path.getsize(log_path), 0)
+        self.assertTrue(os.path.exists(log_path + ".1"))
+        self.assertEqual(os.path.getsize(log_path + ".1"), 1000)
+
+    def test_rotate_log_copytruncate_preserves_open_fd(self):
+        log_path = os.path.join(self.temp.name, "active.log")
+        with open(log_path, "a", encoding="utf-8") as f:
+            f.write("first line\n")
+            f.flush()
+
+            # Rotate while file is still held open by a process/daemon
+            rotated = agy_pool.rotate_log_if_needed(log_path, force=True, backup_count=1)
+            self.assertTrue(rotated)
+
+            # Subsequent writes to open fd continue writing to truncated active log
+            f.write("second line\n")
+            f.flush()
+
+        with open(log_path, "r", encoding="utf-8") as f:
+            self.assertEqual(f.read(), "second line\n")
+        with open(log_path + ".1", "r", encoding="utf-8") as f:
+            self.assertEqual(f.read(), "first line\n")
+
+    def test_clear_log(self):
+        log_path = os.path.join(self.temp.name, "clear.log")
+        with open(log_path, "w", encoding="utf-8") as f:
+            f.write("active content\n")
+        with open(log_path + ".1", "w", encoding="utf-8") as f:
+            f.write("backup content\n")
+
+        agy_pool.clear_log(log_path, backup_count=1)
+        self.assertEqual(os.path.getsize(log_path), 0)
+        self.assertFalse(os.path.exists(log_path + ".1"))
+
+    def test_show_logs_clear_and_rotate_flags(self):
+        log_path = os.path.join(self.temp.name, "cli.log")
+        with open(log_path, "w", encoding="utf-8") as f:
+            f.write("log line 1\nlog line 2\n")
+
+        with mock.patch.object(agy_pool, "LOG_FILE", log_path):
+            with mock.patch("sys.stdout") as mock_stdout:
+                agy_pool.show_logs(rotate=True)
+                self.assertTrue(os.path.exists(log_path + ".1"))
+                self.assertEqual(os.path.getsize(log_path), 0)
+
+                agy_pool.show_logs(clear=True)
+                self.assertFalse(os.path.exists(log_path + ".1"))
+
 
 if __name__ == "__main__":
     unittest.main()

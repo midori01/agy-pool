@@ -36,7 +36,7 @@ except ImportError:
     HAS_FCNTL = False
 
 # ----------------- Constants & Configuration -----------------
-VERSION = "0.1.0-alpha4"
+VERSION = "0.1.0-alpha5"
 def _decode_cred(h, k=0x5A):
     return bytes([b ^ k for b in bytes.fromhex(h)]).decode()
 
@@ -114,6 +114,10 @@ GEMINI_DIR = os.path.expanduser("~/.gemini")
 POOL_CONFIG_FILE = os.path.join(GEMINI_DIR, "agy-pool-accounts.json")
 PID_FILE = os.path.join(GEMINI_DIR, "agy-pool.pid")
 LOG_FILE = os.path.join(GEMINI_DIR, "agy-pool.log")
+DEFAULT_MAX_LOG_BYTES = 5 * 1024 * 1024  # 5 MB
+DEFAULT_BACKUP_LOG_COUNT = 1
+MAX_LOG_BYTES = int(os.environ.get("AGY_LOG_MAX_BYTES", DEFAULT_MAX_LOG_BYTES))
+BACKUP_LOG_COUNT = int(os.environ.get("AGY_LOG_BACKUP_COUNT", DEFAULT_BACKUP_LOG_COUNT))
 AGY_CLI_DIR = os.path.join(GEMINI_DIR, "antigravity-cli")
 AGY_TOKEN_FILE = os.path.join(AGY_CLI_DIR, "antigravity-oauth-token")
 
@@ -1236,6 +1240,191 @@ def do_verify(target=None):
     return True
 
 
+# ----------------- Log Management & Rotation -----------------
+_LAST_LOG_ROTATE_CHECK = 0
+_LOG_ROTATE_INTERVAL = 30  # seconds between size checks in active request loop
+
+
+def _format_size(bytes_val):
+    if bytes_val < 1024:
+        return f"{bytes_val} B"
+    elif bytes_val < 1024 * 1024:
+        return f"{bytes_val / 1024:.1f} KB"
+    else:
+        return f"{bytes_val / (1024 * 1024):.1f} MB"
+
+
+def rotate_log_if_needed(log_path=LOG_FILE, max_bytes=MAX_LOG_BYTES, backup_count=BACKUP_LOG_COUNT, force=False):
+    """
+    Performs copytruncate log rotation if the file exceeds max_bytes (or force=True).
+    Retains open file descriptors without disruption to running background daemons.
+    Returns True if rotated, False otherwise.
+    """
+    if not os.path.exists(log_path):
+        return False
+    if not force:
+        try:
+            if os.path.getsize(log_path) < max_bytes:
+                return False
+        except OSError:
+            return False
+
+    lock_file = log_path + ".lock"
+    try:
+        with _file_lock(lock_file):
+            if not os.path.exists(log_path):
+                return False
+            if not force:
+                try:
+                    if os.path.getsize(log_path) < max_bytes:
+                        return False
+                except OSError:
+                    return False
+
+            # Shift existing backups: .2 -> .3, .1 -> .2, etc.
+            for i in range(backup_count - 1, 0, -1):
+                src = f"{log_path}.{i}"
+                dst = f"{log_path}.{i + 1}"
+                if os.path.exists(src):
+                    try:
+                        os.replace(src, dst)
+                    except OSError:
+                        pass
+
+            if backup_count > 0:
+                backup_dst = f"{log_path}.1"
+                try:
+                    shutil.copyfile(log_path, backup_dst)
+                except OSError:
+                    pass
+
+            # In-place truncation preserving open file descriptors (copytruncate)
+            try:
+                with open(log_path, "r+", encoding="utf-8", errors="ignore") as f:
+                    f.truncate(0)
+                    f.flush()
+            except OSError:
+                try:
+                    with open(log_path, "w", encoding="utf-8", errors="ignore"):
+                        pass
+                except OSError:
+                    pass
+            return True
+    except Exception as e:
+        try:
+            sys.stderr.write(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [LOG ROTATE ERROR] {e}\n")
+            sys.stderr.flush()
+        except Exception:
+            pass
+        return False
+
+
+def clear_log(log_path=LOG_FILE, backup_count=BACKUP_LOG_COUNT):
+    """Safely clears/truncates active log file and removes backup logs."""
+    lock_file = log_path + ".lock"
+    with _file_lock(lock_file):
+        if os.path.exists(log_path):
+            try:
+                with open(log_path, "r+", encoding="utf-8", errors="ignore") as f:
+                    f.truncate(0)
+                    f.flush()
+            except OSError:
+                try:
+                    with open(log_path, "w", encoding="utf-8", errors="ignore"):
+                        pass
+                except OSError:
+                    pass
+        for i in range(1, backup_count + 2):
+            b_path = f"{log_path}.{i}"
+            if os.path.exists(b_path):
+                try:
+                    os.remove(b_path)
+                except OSError:
+                    pass
+
+
+def _maybe_rotate_log():
+    global _LAST_LOG_ROTATE_CHECK
+    now = time.time()
+    if now - _LAST_LOG_ROTATE_CHECK >= _LOG_ROTATE_INTERVAL:
+        _LAST_LOG_ROTATE_CHECK = now
+        rotate_log_if_needed()
+
+
+def show_logs(lines=20, follow=False, clear=False, rotate=False):
+    if clear:
+        clear_log(LOG_FILE, BACKUP_LOG_COUNT)
+        print(f"{CLR_GREEN}✓ Successfully cleared gateway log ({LOG_FILE}){CLR_RESET}")
+        return
+
+    if rotate:
+        if not os.path.exists(LOG_FILE) or os.path.getsize(LOG_FILE) == 0:
+            print(f"{CLR_YELLOW}Log file is empty or does not exist, rotation skipped.{CLR_RESET}")
+            return
+        success = rotate_log_if_needed(LOG_FILE, max_bytes=MAX_LOG_BYTES, backup_count=BACKUP_LOG_COUNT, force=True)
+        if success:
+            print(f"{CLR_GREEN}✓ Rotated active log: {LOG_FILE} -> {LOG_FILE}.1{CLR_RESET}")
+        else:
+            print(f"{CLR_RED}[Error] Log rotation failed.{CLR_RESET}")
+        return
+
+    if not os.path.exists(LOG_FILE):
+        print(f"{CLR_YELLOW}Log file does not exist yet: {LOG_FILE}{CLR_RESET}")
+        return
+
+    try:
+        size = os.path.getsize(LOG_FILE)
+    except OSError:
+        size = 0
+
+    backup_info = ""
+    backup_file = f"{LOG_FILE}.1"
+    if os.path.exists(backup_file):
+        try:
+            b_size = os.path.getsize(backup_file)
+            backup_info = f" | Backup: {_format_size(b_size)}"
+        except OSError:
+            pass
+
+    all_lines = []
+    try:
+        with open(LOG_FILE, "r", encoding="utf-8", errors="ignore") as f:
+            all_lines = f.readlines()
+    except Exception as e:
+        print(f"{CLR_RED}[Error] Failed to read log file: {e}{CLR_RESET}")
+        return
+
+    total_lines = len(all_lines)
+    print("=" * 68)
+    print("                    Antigravity Gateway Log                         ")
+    print("=" * 68)
+    print(f"Path: {LOG_FILE}")
+    print(f"Size: {_format_size(size)} ({total_lines:,} lines){backup_info}")
+    print(f"Policy: Auto-rotate at {_format_size(MAX_LOG_BYTES)} (retaining {BACKUP_LOG_COUNT} backup)")
+    print("-" * 68)
+
+    tail_lines = all_lines[-lines:] if lines > 0 else all_lines
+    for line in tail_lines:
+        sys.stdout.write(line)
+    sys.stdout.flush()
+
+    if follow:
+        print("-" * 68)
+        print(f"{CLR_CYAN}Streaming live logs (Ctrl+C to stop)...{CLR_RESET}")
+        try:
+            with open(LOG_FILE, "r", encoding="utf-8", errors="ignore") as f:
+                f.seek(0, os.SEEK_END)
+                while True:
+                    line = f.readline()
+                    if line:
+                        sys.stdout.write(line)
+                        sys.stdout.flush()
+                    else:
+                        time.sleep(0.2)
+        except KeyboardInterrupt:
+            print(f"\n{CLR_DIM}Stream stopped.{CLR_RESET}")
+
+
 # ----------------- Smart Reverse Proxy Gateway -----------------
 HOP_BY_HOP_HEADERS = {
     "connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
@@ -1443,6 +1632,8 @@ class SmartProxyHandler(http.server.BaseHTTPRequestHandler):
         is_generation = ("generatecontent" in path.lower())
         is_sse = is_generation or ("stream" in path.lower()) or ("text/event-stream" in str(self.headers.get("Accept", "")).lower())
 
+        _maybe_rotate_log()
+
         pool = load_pool()
         accounts = pool.get("accounts", [])
         if not accounts:
@@ -1602,6 +1793,7 @@ class SmartProxyHandler(http.server.BaseHTTPRequestHandler):
 
 
 def start_proxy_daemon(foreground=False):
+    rotate_log_if_needed()
     if not foreground and is_daemon_running():
         print(f"{CLR_YELLOW}Proxy daemon is already running (PID: {get_daemon_pid()}).{CLR_RESET}")
         return
@@ -1922,6 +2114,12 @@ def main():
     # verify
     ver_p = subparsers.add_parser("verify", help="Open Google security verification URL for restricted account")
     ver_p.add_argument("target", nargs="?", default=None, help="Account index or email (defaults to first restricted account)")
+    # log / logs
+    log_p = subparsers.add_parser("log", aliases=["logs"], help="View, follow, or manage gateway proxy logs")
+    log_p.add_argument("-n", "--lines", type=int, default=20, help="Number of lines to display (default: 20)")
+    log_p.add_argument("-f", "--follow", action="store_true", help="Follow log output in real-time (like tail -f)")
+    log_p.add_argument("--clear", "--clean", action="store_true", help="Clear and truncate active log and backups")
+    log_p.add_argument("--rotate", action="store_true", help="Force immediate log rotation")
     # daemon control
     subparsers.add_parser("start", help="Start background load balancer proxy daemon")
     subparsers.add_parser("stop", help="Stop background load balancer proxy daemon")
@@ -1951,6 +2149,8 @@ def main():
         switch_account(args.target)
     elif cmd == "verify":
         do_verify(args.target)
+    elif cmd in ["log", "logs"]:
+        show_logs(lines=args.lines, follow=args.follow, clear=args.clear, rotate=args.rotate)
     elif cmd == "start":
         start_proxy_daemon(foreground=False)
     elif cmd == "stop":

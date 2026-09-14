@@ -5,6 +5,20 @@ All notable changes to the `agy-pool` project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.0-alpha5] - 2026-09-14
+
+### Added
+- **Automatic In-Place Log Rotation (`copytruncate`)**:
+  - Implemented zero-dependency automated log rotation preserving open file descriptors across background daemons and child processes.
+  - Automatically triggers when active log reaches 5 MB (configurable via `AGY_LOG_MAX_BYTES`), rotating to `agy-pool.log.1` and truncating the active log to cap total disk usage strictly under 10 MB.
+  - Added periodic rate-limited size monitoring during proxy requests and at daemon startup.
+- **New `log` / `logs` Management CLI Subcommand**:
+  - `agy-pool log`: Displays current log path, file size, line count, backup status, and recent log entries.
+  - Supports `-n / --lines <N>` to customize output lines.
+  - Supports `-f / --follow` for live streaming log output (`tail -f` behavior).
+  - Supports `--rotate` to force immediate rotation.
+  - Supports `--clear / --clean` to safely truncate the active log and remove backups.
+
 ## [0.1.0-alpha4] - 2026-09-14
 
 ### Added
