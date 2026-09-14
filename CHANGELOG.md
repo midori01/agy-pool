@@ -5,6 +5,19 @@ All notable changes to the `agy-pool` project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.0-alpha3] - 2026-09-14
+
+### Added
+- **Comprehensive Automated Test Suite**: Integrated 23 rigorous unit tests in `tests/test_agy_pool.py` covering multi-process file locking, single-flight token refresh, pre-stream failover, and request body framing.
+- **Automated CI Workflow**: GitHub Actions workflow running tests across commits and pull requests.
+
+### Fixed & Hardened
+- **Process State Concurrency & Atomic Transactions**: Introduced `pool_transaction` with transactional read-modify-write semantics and sidecar file locks, preventing lost updates and data corruption under high concurrent load.
+- **Single-Flight Per-Account Token Refresh**: Added fine-grained per-account locks during token refresh to eliminate thundering herd requests to Google OAuth.
+- **HTTP/1.1 RFC 7230 Compliant Proxying**: Hardened chunked request body parsing with size and trailer validation; dynamic hop-by-hop header removal derived from `Connection`.
+- **Committed Stream Truncation Protection**: Prevents replaying requests to subsequent accounts if a generation stream fails after response headers have already been committed to the client.
+- **SQLite Read-Only Session Continuity**: Querying conversation summaries uses strictly read-only connections (`?mode=ro`, `PRAGMA query_only=ON`) with busy timeout to avoid write lock contention with native `agy`.
+
 ## [0.1.0-alpha2] - 2026-09-14
 
 ### Added
