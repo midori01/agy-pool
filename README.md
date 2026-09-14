@@ -52,7 +52,7 @@ cd ~/agy-pool && bash install.sh
 
 ### Option B: Clone / Install from Source
 ```bash
-git clone https://github.com/vlxlv/agy-pool.git ~/agy-pool
+git clone https://github.com/midori01/agy-pool.git ~/agy-pool
 cd ~/agy-pool && bash install.sh
 ```
 

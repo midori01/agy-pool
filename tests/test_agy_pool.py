@@ -1,3 +1,4 @@
+import contextlib
 import email.message
 import http.client
 import http.server
@@ -561,6 +562,7 @@ class AgyPoolTest(unittest.TestCase):
                                ("old", "Old", json.dumps(["file://" + workspace]), 1))
             connection.execute("INSERT INTO conversation_summaries VALUES (?, ?, ?, ?)",
                                ("new", "New", json.dumps(["file://" + workspace]), 2))
+        connection.close()
         self.assertEqual(agy_pool.find_latest_conversation_for_dir(workspace)[0], "new")
 
     def test_agy_raw_bypasses_proxy_and_preserves_arguments(self):
