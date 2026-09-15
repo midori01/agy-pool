@@ -854,6 +854,68 @@ class AgyPoolTest(unittest.TestCase):
         acc_a = next(a for a in pool if a["email"] == "a@example.test")
         self.assertEqual(acc_a["refresh_token"], "new-refresh-a")
 
+    def test_daemon_info_and_outdated_detection(self):
+        agy_pool.ensure_dirs()
+        # 1. Non-existent PID file
+        if os.path.exists(agy_pool.PID_FILE):
+            os.unlink(agy_pool.PID_FILE)
+        self.assertIsNone(agy_pool.get_daemon_info())
+
+        # 2. Legacy integer PID file
+        my_pid = os.getpid()
+        with open(agy_pool.PID_FILE, "w", encoding="utf-8") as f:
+            f.write(str(my_pid))
+        info = agy_pool.get_daemon_info()
+        self.assertIsNotNone(info)
+        self.assertEqual(info["pid"], my_pid)
+        self.assertIsNone(info["version"])
+
+        # 3. Structured JSON PID file
+        meta = {"pid": my_pid, "version": agy_pool.VERSION, "script_mtime": int(time.time()) + 1000}
+        with open(agy_pool.PID_FILE, "w", encoding="utf-8") as f:
+            json.dump(meta, f)
+        info = agy_pool.get_daemon_info()
+        self.assertIsNotNone(info)
+        self.assertEqual(info["pid"], my_pid)
+        self.assertEqual(info["version"], agy_pool.VERSION)
+
+        # 4. Outdated detection
+        with mock.patch.object(agy_pool, "is_port_listening", return_value=True):
+            # Same version, future script_mtime -> not outdated
+            self.assertFalse(agy_pool.is_daemon_outdated())
+
+            # Older version -> outdated
+            meta["version"] = "0.1.0-alpha1"
+            with open(agy_pool.PID_FILE, "w", encoding="utf-8") as f:
+                json.dump(meta, f)
+            self.assertTrue(agy_pool.is_daemon_outdated())
+
+            # Outdated mtime -> outdated
+            meta["version"] = agy_pool.VERSION
+            meta["script_mtime"] = 100  # long past
+            with open(agy_pool.PID_FILE, "w", encoding="utf-8") as f:
+                json.dump(meta, f)
+            self.assertTrue(agy_pool.is_daemon_outdated())
+
+    def test_ensure_daemon_running_hot_reloads_outdated_daemon(self):
+        with mock.patch.object(agy_pool, "is_daemon_running", return_value=True), \
+             mock.patch.object(agy_pool, "is_daemon_outdated", return_value=True), \
+             mock.patch.object(agy_pool, "get_daemon_pid", return_value=1234), \
+             mock.patch.object(agy_pool, "stop_proxy_daemon") as mock_stop, \
+             mock.patch.object(agy_pool, "start_proxy_daemon") as mock_start, \
+             mock.patch("time.sleep"):
+            agy_pool.ensure_daemon_running()
+            mock_stop.assert_called_once()
+            mock_start.assert_called_once_with(foreground=False)
+
+    def test_cli_version_command(self):
+        buf = io.StringIO()
+        with mock.patch("sys.argv", ["agy-pool", "version"]), \
+             mock.patch("sys.stdout", buf):
+            agy_pool.main()
+        self.assertIn(f"agy-pool {agy_pool.VERSION}", buf.getvalue())
+
 
 if __name__ == "__main__":
     unittest.main()
+

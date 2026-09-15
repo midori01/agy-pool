@@ -5,6 +5,23 @@ All notable changes to the `agy-pool` project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.0-alpha8] - 2026-09-15
+
+### Added
+- **Automated Gateway Daemon Hot-Reload Guard (`ensure_daemon_running`)**:
+  - Automatically verifies in-memory daemon bytecode version and script file modification timestamp (`script_mtime`) stored in `PID_FILE` against active CLI code on disk.
+  - Transparently and gracefully hot-restarts the gateway proxy daemon (~0.5s) upon running `agy` or `agy-pool start` whenever code updates occur, permanently preventing stale in-memory execution or frozen metrics across upgrades.
+- **Daemon Metadata & Health Observability**:
+  - `PID_FILE` structured JSON serialization storing PID, loaded code version, and launch timestamp with full backward-compatibility for legacy integer PID files.
+  - Enhanced `agy-pool status` to display running daemon version (e.g., `PID: 5263 [v0.1.0-alpha8]`) and explicitly warn when the running process is executing outdated disk code (`⚠ Outdated Code`).
+  - Added native `agy-pool version` CLI subcommand and fast dispatch.
+- **Robust Daemon Cleanup on Exit**:
+  - Hardened daemon process exit handlers to directly inspect PID file ownership on shutdown, ensuring reliable PID file cleanup across environments and test runners.
+
+### Fixed
+- **Pure AI Generation Metric Tracking (`Hits`)**:
+  - Fixed an issue where a long-running proxy daemon instance in memory could retain pre-alpha6 bytecode, causing `gen_count` to stay frozen while quota decreased during user requests.
+
 ## [0.1.0-alpha7] - 2026-09-15
 
 ### Added

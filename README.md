@@ -1,6 +1,6 @@
 # agy-pool: Antigravity Multi-Account Quota Pool & Intelligent Load Balancer Suite
 
-[![Version](https://img.shields.io/badge/version-0.1.0--alpha7-blue.svg)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-0.1.0--alpha8-blue.svg)](CHANGELOG.md)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Platform](https://img.shields.io/badge/platform-Termux%20%7C%20Linux%20%7C%20macOS-green.svg)](#)
 [![Python: 3.8+](https://img.shields.io/badge/python-3.8+-blue.svg)](#)
@@ -19,6 +19,7 @@ A zero-dependency multi-account quota pool and local reverse proxy for **Antigra
 
 - **Zero External Dependencies**: Built 100% on the Python 3 standard library (`urllib`, `http.server`, `sqlite3`, `fcntl`, `hashlib`, `hmac`). Runs instantly on any Termux or Linux system with no `pip` or wheel compilation.
 - **Intelligent Load Balancing & Fast Failover**: Dynamically routes CLI generation requests based on cached model quotas. Automatically fails over in-flight requests (<100ms) upon hitting HTTP 429 or quota exhaustion, dynamically promoting healthy accounts.
+- **Automated Hot-Reload & Self-Healing Daemon**: Tracks in-memory daemon bytecode version and script mtime, seamlessly hot-reloading background proxy instances (~0.5s) upon disk code updates or CLI invocations to prevent stale metric drift.
 - **Cross-Device Migration & Encrypted Backup**: Easily backup and restore entire account pools across Termux, VPS, or desktop machines via `export` and `import`. Supports tamper-proof passphrase encryption (PBKDF2-HMAC-SHA256 + CTR keystream), automatic deduplication/merging, and Unix pipe streaming (`-`).
 - **Account-Agnostic Session Continuity (`agy -c`)**: Automatically queries `conversation_summaries.db` to identify the most recent session for the current workspace directory, allowing seamless workflow resumption across different accounts.
 - **Security Isolation & Self-Healing**: Detects Google Cloud Code verification challenges (`VALIDATION_REQUIRED` / 403) and token revocations, isolates restricted accounts to prevent quota deadlocks, and provides one-click browser verification (`agy-pool verify`).

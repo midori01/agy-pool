@@ -39,7 +39,7 @@ except ImportError:
     HAS_FCNTL = False
 
 # ----------------- Constants & Configuration -----------------
-VERSION = "0.1.0-alpha7"
+VERSION = "0.1.0-alpha8"
 def _decode_cred(h, k=0x5A):
     return bytes([b ^ k for b in bytes.fromhex(h)]).decode()
 
@@ -2106,11 +2106,17 @@ class SmartProxyHandler(http.server.BaseHTTPRequestHandler):
 
 def start_proxy_daemon(foreground=False):
     rotate_log_if_needed()
-    if not foreground and is_daemon_running():
-        print(f"{CLR_YELLOW}Proxy daemon is already running (PID: {get_daemon_pid()}).{CLR_RESET}")
-        return
-
     if not foreground:
+        if is_daemon_running():
+            if is_daemon_outdated():
+                pid = get_daemon_pid()
+                print(f"{CLR_CYAN}Proxy daemon (PID: {pid}) is running outdated code. Restarting...{CLR_RESET}")
+                stop_proxy_daemon()
+                time.sleep(0.5)
+            else:
+                print(f"{CLR_YELLOW}Proxy daemon is already running (PID: {get_daemon_pid()}).{CLR_RESET}")
+                return
+
         # Launch background process
         cmd = [sys.executable, os.path.abspath(__file__), "daemon-run"]
         ensure_dirs()
@@ -2140,7 +2146,13 @@ def start_proxy_daemon(foreground=False):
             signal.signal(signal.SIGTERM, stop_server)
             signal.signal(signal.SIGINT, stop_server)
             try:
-                _atomic_json_write(PID_FILE, os.getpid())
+                curr_script = os.path.realpath(__file__)
+                curr_mtime = int(os.path.getmtime(curr_script)) if os.path.exists(curr_script) else int(time.time())
+                _atomic_json_write(PID_FILE, {
+                    "pid": os.getpid(),
+                    "version": VERSION,
+                    "script_mtime": curr_mtime,
+                })
 
                 def background_refresher():
                     while True:
@@ -2157,9 +2169,15 @@ def start_proxy_daemon(foreground=False):
             finally:
                 try:
                     with open(PID_FILE, "r", encoding="utf-8") as f:
-                        if int(f.read().strip()) == os.getpid():
-                            os.unlink(PID_FILE)
-                except (OSError, ValueError):
+                        raw = f.read().strip()
+                    file_pid = None
+                    if raw.startswith("{"):
+                        file_pid = int(json.loads(raw).get("pid", 0))
+                    elif raw:
+                        file_pid = int(raw)
+                    if file_pid == os.getpid():
+                        os.unlink(PID_FILE)
+                except (OSError, ValueError, json.JSONDecodeError):
                     pass
     except BlockingIOError:
         return
@@ -2192,22 +2210,36 @@ def stop_proxy_daemon():
                 pass
 
 
-def get_daemon_pid():
+def get_daemon_info():
     if not os.path.exists(PID_FILE):
         return None
     try:
-        with open(PID_FILE, "r") as f:
-            pid = int(f.read().strip())
+        with open(PID_FILE, "r", encoding="utf-8") as f:
+            content = f.read().strip()
+        if content.startswith("{"):
+            data = json.loads(content)
+            pid = int(data.get("pid", 0))
+            version = data.get("version")
+            script_mtime = data.get("script_mtime")
+        else:
+            pid = int(content)
+            version = None
+            script_mtime = None
         os.kill(pid, 0)
         cmdline_path = f"/proc/{pid}/cmdline"
         if os.path.exists(cmdline_path):
             with open(cmdline_path, "rb") as f:
                 cmd = f.read().decode(errors="ignore")
-                if "agy-pool" not in cmd:
+                if "agy-pool" not in cmd and "python" not in cmd:
                     return None
-        return pid
+        return {"pid": pid, "version": version, "script_mtime": script_mtime}
     except Exception:
         return None
+
+
+def get_daemon_pid():
+    info = get_daemon_info()
+    return info["pid"] if info else None
 
 
 def is_port_listening(port=DEFAULT_PORT):
@@ -2221,6 +2253,41 @@ def is_daemon_running():
     if not pid:
         return False
     return is_port_listening()
+
+
+def is_daemon_outdated():
+    info = get_daemon_info()
+    if not info or not is_port_listening():
+        return False
+    running_ver = info.get("version")
+    if not running_ver or running_ver != VERSION:
+        return True
+    try:
+        curr_script = os.path.realpath(__file__)
+        if os.path.exists(curr_script):
+            curr_mtime = int(os.path.getmtime(curr_script))
+            daemon_mtime = info.get("script_mtime")
+            if daemon_mtime and curr_mtime > daemon_mtime:
+                return True
+    except Exception:
+        pass
+    return False
+
+
+def ensure_daemon_running():
+    """
+    Ensures proxy daemon is running AND running the current version/script code.
+    If daemon is running outdated code or stopped, automatically restarts it.
+    """
+    if not is_daemon_running():
+        start_proxy_daemon(foreground=False)
+    elif is_daemon_outdated():
+        pid = get_daemon_pid()
+        sys.stderr.write(f"{CLR_CYAN}[agy-pool] Hot-reloading gateway daemon with latest updates (PID {pid})...{CLR_RESET}\n")
+        sys.stderr.flush()
+        stop_proxy_daemon()
+        time.sleep(0.5)
+        start_proxy_daemon(foreground=False)
 
 
 # ----------------- CLI Wrappers -----------------
@@ -2336,8 +2403,7 @@ def resolve_continue_arg(extra_args):
 def run_agy_with_lb(extra_args):
     """Ensures LB daemon is running and executes agy with dynamic load balancing."""
     extra_args = resolve_continue_arg(extra_args)
-    if not is_daemon_running():
-        start_proxy_daemon(foreground=False)
+    ensure_daemon_running()
 
     env = os.environ.copy()
     env["CLOUD_CODE_URL"] = f"http://127.0.0.1:{DEFAULT_PORT}"
@@ -2395,6 +2461,7 @@ def main():
         elif sys.argv[1] in ["-v", "--version", "version"]:
             print(f"agy-pool {VERSION}")
             return
+
     parser = argparse.ArgumentParser(
         prog="agy-pool",
         description="Antigravity Multi-Account Pool & Load Balancer for Termux",
@@ -2451,6 +2518,7 @@ def main():
     subparsers.add_parser("stop", help="Stop background load balancer proxy daemon")
     subparsers.add_parser("restart", help="Restart background load balancer proxy daemon")
     subparsers.add_parser("status", help="Check status of proxy daemon and pool")
+    subparsers.add_parser("version", help="Show version information")
     subparsers.add_parser("daemon-run", help=argparse.SUPPRESS)  # Internal daemon worker
     # run wrapper
     run_p = subparsers.add_parser("run", help="Run agy through the load balancer")
@@ -2490,12 +2558,18 @@ def main():
         time.sleep(1)
         start_proxy_daemon(foreground=False)
     elif cmd == "status":
-        pid = get_daemon_pid()
-        if pid:
-            print(f"{CLR_GREEN}✓ Gateway Proxy is RUNNING (PID: {pid}) on http://127.0.0.1:{DEFAULT_PORT}{CLR_RESET}")
+        info = get_daemon_info()
+        if info and is_port_listening():
+            ver_note = f" [v{info['version']}]" if info.get("version") else ""
+            if is_daemon_outdated():
+                print(f"{CLR_YELLOW}⚠ Gateway Proxy is RUNNING (PID: {info['pid']}{ver_note}, Outdated Code). Run 'agy-pool restart' to reload.{CLR_RESET}")
+            else:
+                print(f"{CLR_GREEN}✓ Gateway Proxy is RUNNING (PID: {info['pid']}{ver_note}) on http://127.0.0.1:{DEFAULT_PORT}{CLR_RESET}")
         else:
             print(f"{CLR_YELLOW}○ Gateway Proxy is STOPPED{CLR_RESET}")
         list_accounts()
+    elif cmd == "version":
+        print(f"agy-pool {VERSION}")
     elif cmd == "daemon-run":
         start_proxy_daemon(foreground=True)
     elif cmd == "run":
