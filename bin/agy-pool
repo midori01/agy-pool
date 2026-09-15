@@ -25,6 +25,9 @@ import subprocess
 import argparse
 import contextlib
 import hashlib
+import hmac
+import secrets
+import getpass
 import http.client
 import tempfile
 from datetime import datetime, timezone
@@ -36,7 +39,7 @@ except ImportError:
     HAS_FCNTL = False
 
 # ----------------- Constants & Configuration -----------------
-VERSION = "0.1.0-alpha6"
+VERSION = "0.1.0-alpha7"
 def _decode_cred(h, k=0x5A):
     return bytes([b ^ k for b in bytes.fromhex(h)]).decode()
 
@@ -1251,6 +1254,302 @@ def do_verify(target=None):
     return True
 
 
+# ----------------- Backup & Migration (Export / Import) -----------------
+def encrypt_bundle(data_bytes, password):
+    salt = secrets.token_bytes(16)
+    nonce = secrets.token_bytes(16)
+    dk = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, 100000, dklen=64)
+    key_enc = dk[:32]
+    key_mac = dk[32:]
+
+    ciphertext = bytearray(len(data_bytes))
+    block_size = 32
+    num_blocks = (len(data_bytes) + block_size - 1) // block_size
+    for i in range(num_blocks):
+        ctr = nonce + i.to_bytes(8, "big")
+        ks_block = hmac.new(key_enc, ctr, hashlib.sha256).digest()
+        start = i * block_size
+        end = min(start + block_size, len(data_bytes))
+        for j in range(start, end):
+            ciphertext[j] = data_bytes[j] ^ ks_block[j - start]
+
+    tag = hmac.new(key_mac, salt + nonce + bytes(ciphertext), hashlib.sha256).digest()
+    return {
+        "format": "agy-pool-encrypted-v1",
+        "kdf": "pbkdf2_hmac_sha256",
+        "iterations": 100000,
+        "salt": base64.b64encode(salt).decode("ascii"),
+        "nonce": base64.b64encode(nonce).decode("ascii"),
+        "ciphertext": base64.b64encode(ciphertext).decode("ascii"),
+        "tag": base64.b64encode(tag).decode("ascii")
+    }
+
+
+def decrypt_bundle(payload, password):
+    if not isinstance(payload, dict) or payload.get("format") != "agy-pool-encrypted-v1":
+        raise ValueError("Unsupported or invalid encrypted bundle format")
+    try:
+        salt = base64.b64decode(payload["salt"])
+        nonce = base64.b64decode(payload["nonce"])
+        ciphertext = base64.b64decode(payload["ciphertext"])
+        tag = base64.b64decode(payload["tag"])
+        iterations = int(payload.get("iterations", 100000))
+    except Exception as e:
+        raise ValueError(f"Corrupted encrypted bundle metadata: {e}")
+
+    dk = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, iterations, dklen=64)
+    key_enc = dk[:32]
+    key_mac = dk[32:]
+
+    expected_tag = hmac.new(key_mac, salt + nonce + ciphertext, hashlib.sha256).digest()
+    if not hmac.compare_digest(tag, expected_tag):
+        raise ValueError("Invalid password or corrupted backup payload")
+
+    plaintext = bytearray(len(ciphertext))
+    block_size = 32
+    num_blocks = (len(ciphertext) + block_size - 1) // block_size
+    for i in range(num_blocks):
+        ctr = nonce + i.to_bytes(8, "big")
+        ks_block = hmac.new(key_enc, ctr, hashlib.sha256).digest()
+        start = i * block_size
+        end = min(start + block_size, len(ciphertext))
+        for j in range(start, end):
+            plaintext[j] = ciphertext[j] ^ ks_block[j - start]
+
+    return bytes(plaintext)
+
+
+def export_pool(file_path=None, encrypt=False, password=None, no_stats=False):
+    pool = load_pool()
+    accounts = pool.get("accounts", [])
+    if not accounts:
+        print(f"\n{CLR_YELLOW}No accounts in pool to export.{CLR_RESET}")
+        return False
+
+    export_accounts = []
+    for acc in accounts:
+        item = {
+            "email": acc.get("email"),
+            "name": acc.get("name"),
+            "refresh_token": acc.get("refresh_token"),
+            "access_token": acc.get("access_token"),
+            "token_expiry": acc.get("token_expiry"),
+            "created_at": acc.get("created_at"),
+        }
+        if not no_stats:
+            item["request_count"] = acc.get("request_count", 0)
+            item["gen_count"] = acc.get("gen_count", 0)
+        if acc.get("last_quota"):
+            item["last_quota"] = acc.get("last_quota")
+        export_accounts.append(item)
+
+    active_email = None
+    active_id = pool.get("active_account_id")
+    for acc in accounts:
+        if acc.get("id") == active_id:
+            active_email = acc.get("email")
+            break
+
+    bundle = {
+        "version": 1,
+        "app": "agy-pool",
+        "exported_at": int(time.time()),
+        "strategy": pool.get("strategy", "max_quota"),
+        "active_account_email": active_email,
+        "accounts": export_accounts,
+    }
+
+    raw_json = json.dumps(bundle, indent=2, ensure_ascii=False)
+    is_encrypt = encrypt or bool(password)
+
+    if is_encrypt:
+        if not password:
+            if not sys.stdin.isatty():
+                sys.stderr.write(f"{CLR_RED}[Error] Password required when encrypting in non-interactive mode. Use --password <pass>.{CLR_RESET}\n")
+                return False
+            while True:
+                p1 = getpass.getpass("Enter passphrase to encrypt backup: ")
+                if not p1:
+                    print(f"{CLR_RED}Passphrase cannot be empty.{CLR_RESET}")
+                    continue
+                p2 = getpass.getpass("Confirm passphrase: ")
+                if p1 != p2:
+                    print(f"{CLR_RED}Passphrases do not match. Try again.{CLR_RESET}")
+                    continue
+                password = p1
+                break
+        encrypted_data = encrypt_bundle(raw_json.encode("utf-8"), password)
+        output_content = json.dumps(encrypted_data, indent=2)
+    else:
+        output_content = raw_json
+
+    if file_path == "-":
+        sys.stdout.write(output_content + "\n")
+        return True
+
+    if not file_path:
+        ext = ".enc" if is_encrypt else ".json"
+        date_str = datetime.now().strftime("%Y%m%d_%H%M%S")
+        file_path = f"agy-pool-backup-{date_str}{ext}"
+
+    directory = os.path.dirname(os.path.abspath(file_path))
+    os.makedirs(directory, mode=0o700, exist_ok=True)
+    fd = os.open(file_path, os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        f.write(output_content + "\n")
+
+    enc_label = f" ({CLR_GREEN}Encrypted with passphrase{CLR_RESET})" if is_encrypt else ""
+    print(f"\n{CLR_GREEN}✓ Successfully exported {len(export_accounts)} account(s) to:{CLR_RESET}")
+    print(f"  {CLR_BOLD}{file_path}{CLR_RESET}{enc_label}")
+    print(f"{CLR_DIM}  File permissions: 0600 (Restricted to current user).{CLR_RESET}\n")
+    return True
+
+
+def import_pool(file_path, password=None, replace=False, skip_existing=False):
+    if file_path == "-":
+        content = sys.stdin.read()
+    else:
+        if not os.path.exists(file_path):
+            sys.stderr.write(f"{CLR_RED}[Error] Backup file '{file_path}' does not exist.{CLR_RESET}\n")
+            return False
+        with open(file_path, "r", encoding="utf-8") as f:
+            content = f.read()
+
+    try:
+        raw_obj = json.loads(content)
+    except Exception as e:
+        sys.stderr.write(f"{CLR_RED}[Error] Failed to parse backup file as JSON: {e}{CLR_RESET}\n")
+        return False
+
+    if isinstance(raw_obj, dict) and raw_obj.get("format") == "agy-pool-encrypted-v1":
+        if not password:
+            if not sys.stdin.isatty():
+                sys.stderr.write(f"{CLR_RED}[Error] Password required to decrypt backup in non-interactive mode. Use --password <pass>.{CLR_RESET}\n")
+                return False
+            password = getpass.getpass("Enter passphrase to decrypt backup: ")
+        try:
+            plaintext = decrypt_bundle(raw_obj, password)
+            raw_obj = json.loads(plaintext.decode("utf-8"))
+        except Exception as e:
+            sys.stderr.write(f"{CLR_RED}[Error] Decryption failed: {e}{CLR_RESET}\n")
+            return False
+
+    if not isinstance(raw_obj, dict) or "accounts" not in raw_obj or not isinstance(raw_obj["accounts"], list):
+        sys.stderr.write(f"{CLR_RED}[Error] Invalid backup format: missing 'accounts' list.{CLR_RESET}\n")
+        return False
+
+    imported_accounts = raw_obj["accounts"]
+    if not imported_accounts:
+        print(f"{CLR_YELLOW}Backup contains no accounts. Nothing imported.{CLR_RESET}")
+        return False
+
+    imported_strategy = raw_obj.get("strategy")
+    target_active_email = raw_obj.get("active_account_email")
+
+    def mutate(pool):
+        nonlocal target_active_email
+        existing_accounts = pool.get("accounts", [])
+        added_count = 0
+        updated_count = 0
+        skipped_count = 0
+
+        if replace:
+            new_list = []
+            for i, acc in enumerate(imported_accounts, start=1):
+                email = acc.get("email")
+                if not email or not acc.get("refresh_token"):
+                    continue
+                new_acc = {
+                    "id": f"acc_{i}",
+                    "email": email,
+                    "name": acc.get("name"),
+                    "refresh_token": acc["refresh_token"],
+                    "access_token": acc.get("access_token"),
+                    "token_expiry": acc.get("token_expiry", 0),
+                    "created_at": acc.get("created_at", int(time.time())),
+                    "request_count": acc.get("request_count", 0),
+                    "gen_count": acc.get("gen_count", 0),
+                    "error_count": 0,
+                    "last_quota": acc.get("last_quota", {}),
+                }
+                new_list.append(new_acc)
+                added_count += 1
+            pool["accounts"] = new_list
+            if imported_strategy:
+                pool["strategy"] = imported_strategy
+            active_acc = next((a for a in new_list if a.get("email") == target_active_email), None)
+            if not active_acc and new_list:
+                active_acc = new_list[0]
+            pool["active_account_id"] = active_acc["id"] if active_acc else None
+            return (added_count, updated_count, skipped_count, pool.get("active_account_id"))
+
+        email_map = {a.get("email"): a for a in existing_accounts if a.get("email")}
+
+        for acc in imported_accounts:
+            email = acc.get("email")
+            if not email or not acc.get("refresh_token"):
+                continue
+            if email in email_map:
+                if skip_existing:
+                    skipped_count += 1
+                    continue
+                target = email_map[email]
+                target["refresh_token"] = acc["refresh_token"]
+                if acc.get("access_token"):
+                    target["access_token"] = acc["access_token"]
+                    target["token_expiry"] = acc.get("token_expiry", 0)
+                if acc.get("name") and not target.get("name"):
+                    target["name"] = acc.get("name")
+                target.pop("status", None)
+                target.pop("rate_limited_until", None)
+                updated_count += 1
+            else:
+                next_id = _next_account_id(existing_accounts)
+                new_acc = {
+                    "id": next_id,
+                    "email": email,
+                    "name": acc.get("name"),
+                    "refresh_token": acc["refresh_token"],
+                    "access_token": acc.get("access_token"),
+                    "token_expiry": acc.get("token_expiry", 0),
+                    "created_at": acc.get("created_at", int(time.time())),
+                    "request_count": acc.get("request_count", 0),
+                    "gen_count": acc.get("gen_count", 0),
+                    "error_count": 0,
+                    "last_quota": acc.get("last_quota", {}),
+                }
+                existing_accounts.append(new_acc)
+                email_map[email] = new_acc
+                added_count += 1
+
+        pool["accounts"] = existing_accounts
+
+        curr_active = pool.get("active_account_id")
+        active_exists = any(a.get("id") == curr_active for a in existing_accounts)
+        if not active_exists and existing_accounts:
+            pref = next((a for a in existing_accounts if a.get("email") == target_active_email), existing_accounts[0])
+            pool["active_account_id"] = pref["id"]
+
+        return (added_count, updated_count, skipped_count, pool.get("active_account_id"))
+
+    added, updated, skipped, active_id = pool_transaction(mutate)
+
+    pool = load_pool()
+    active_acc = next((a for a in pool.get("accounts", []) if a.get("id") == active_id), None)
+    active_str = f" ({active_acc.get('email')})" if active_acc else ""
+
+    print(f"\n{CLR_GREEN}✓ Import completed successfully:{CLR_RESET}")
+    print(f"  • Added: {CLR_BOLD}{added}{CLR_RESET} new account(s)")
+    print(f"  • Updated: {CLR_BOLD}{updated}{CLR_RESET} existing account(s)")
+    if skipped > 0:
+        print(f"  • Skipped: {CLR_BOLD}{skipped}{CLR_RESET} unchanged account(s)")
+    print(f"  • Total pool size: {CLR_BOLD}{len(pool.get('accounts', []))}{CLR_RESET} account(s)")
+    if active_id:
+        print(f"  • Active account: {CLR_CYAN}{active_id}{active_str}{CLR_RESET}")
+    print(f"\nRun {CLR_BOLD}agy-pool status{CLR_RESET} to refresh quotas.\n")
+    return True
+
+
 # ----------------- Log Management & Rotation -----------------
 _LAST_LOG_ROTATE_CHECK = 0
 _LOG_ROTATE_INTERVAL = 30  # seconds between size checks in active request loop
@@ -2104,6 +2403,8 @@ def main():
   agy-pool login            Add/login a new Google account
   agy-pool list             Refresh and show cached account quotas
   agy-pool switch auto      Switch active account to the one with highest quota
+  agy-pool export           Export accounts pool to a backup JSON file
+  agy-pool import file.json Restore accounts pool from a backup file
   agy-pool start            Start the load balancing reverse proxy daemon
   agy-pool run              Launch agy with automated quota load balancing
 """
@@ -2124,6 +2425,18 @@ def main():
     # switch
     sw_p = subparsers.add_parser("switch", help="Switch current active account (auto or index/email)")
     sw_p.add_argument("target", nargs="?", default="auto", help="Account index, email, or 'auto'")
+    # export / backup
+    exp_p = subparsers.add_parser("export", aliases=["backup"], help="Export and backup accounts pool to JSON or encrypted bundle")
+    exp_p.add_argument("file", nargs="?", default=None, help="Output file path (default: agy-pool-backup-<timestamp>.json, or '-' for stdout)")
+    exp_p.add_argument("-e", "--encrypt", action="store_true", help="Encrypt backup bundle with a passphrase")
+    exp_p.add_argument("-p", "--password", default=None, help="Passphrase for encryption (prompts securely if omitted with --encrypt)")
+    exp_p.add_argument("--no-stats", action="store_true", help="Omit request and generation count statistics")
+    # import / restore
+    imp_p = subparsers.add_parser("import", aliases=["restore"], help="Import and restore accounts pool from backup")
+    imp_p.add_argument("file", help="Input backup file path (or '-' for stdin)")
+    imp_p.add_argument("-p", "--password", default=None, help="Passphrase for encrypted backup (prompts if required)")
+    imp_p.add_argument("--replace", action="store_true", help="Replace all existing accounts instead of merging")
+    imp_p.add_argument("--skip-existing", action="store_true", help="Skip existing accounts instead of updating them")
     # verify
     ver_p = subparsers.add_parser("verify", help="Open Google security verification URL for restricted account")
     ver_p.add_argument("target", nargs="?", default=None, help="Account index or email (defaults to first restricted account)")
@@ -2160,6 +2473,10 @@ def main():
         remove_account(args.target)
     elif cmd == "switch":
         switch_account(args.target)
+    elif cmd in ["export", "backup"]:
+        export_pool(file_path=args.file, encrypt=args.encrypt, password=args.password, no_stats=args.no_stats)
+    elif cmd in ["import", "restore"]:
+        import_pool(file_path=args.file, password=args.password, replace=args.replace, skip_existing=args.skip_existing)
     elif cmd == "verify":
         do_verify(args.target)
     elif cmd in ["log", "logs"]:

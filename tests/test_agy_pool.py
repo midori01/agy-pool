@@ -1,3 +1,4 @@
+import base64
 import contextlib
 import email.message
 import http.client
@@ -742,6 +743,116 @@ class AgyPoolTest(unittest.TestCase):
         self.assertIn("In Rotation Pool", output)
         self.assertNotIn("Total:", output)
         self.assertNotIn("AI Gen:", output)
+
+    def test_crypto_bundle_round_trip(self):
+        msg = b"secret-oauth-data-12345"
+        enc = agy_pool.encrypt_bundle(msg, "pass123")
+        self.assertEqual(enc["format"], "agy-pool-encrypted-v1")
+        dec = agy_pool.decrypt_bundle(enc, "pass123")
+        self.assertEqual(dec, msg)
+
+        with self.assertRaises(ValueError):
+            agy_pool.decrypt_bundle(enc, "wrong-pass")
+
+        # Tamper tag
+        tampered = dict(enc, tag=base64.b64encode(b"0" * 32).decode("ascii"))
+        with self.assertRaises(ValueError):
+            agy_pool.decrypt_bundle(tampered, "pass123")
+
+    def test_export_and_import_plain(self):
+        acc1 = account("a")
+        acc1["name"] = "Alice"
+        acc1["gen_count"] = 10
+        acc1["request_count"] = 25
+        acc2 = account("b")
+        acc2["name"] = "Bob"
+        self.save_accounts([acc1, acc2])
+
+        export_file = os.path.join(self.temp.name, "backup.json")
+        res = agy_pool.export_pool(export_file)
+        self.assertTrue(res)
+        self.assertTrue(os.path.exists(export_file))
+        self.assertEqual(os.stat(export_file).st_mode & 0o777, 0o600)
+
+        with open(export_file, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        self.assertEqual(len(data["accounts"]), 2)
+        self.assertEqual(data["strategy"], "max_quota")
+        self.assertEqual(data["active_account_email"], "a@example.test")
+
+        # Now wipe local pool and import with replace
+        self.save_accounts([])
+        res = agy_pool.import_pool(export_file, replace=True)
+        self.assertTrue(res)
+        restored = agy_pool.load_pool()["accounts"]
+        self.assertEqual(len(restored), 2)
+        self.assertEqual(restored[0]["email"], "a@example.test")
+        self.assertEqual(restored[1]["email"], "b@example.test")
+        self.assertEqual(restored[0]["name"], "Alice")
+        self.assertEqual(restored[0]["gen_count"], 10)
+
+    def test_export_and_import_encrypted(self):
+        acc = account("a")
+        self.save_accounts([acc])
+
+        enc_file = os.path.join(self.temp.name, "backup.enc")
+        res = agy_pool.export_pool(enc_file, encrypt=True, password="mypassword")
+        self.assertTrue(res)
+
+        with open(enc_file, "r", encoding="utf-8") as f:
+            raw = json.load(f)
+        self.assertEqual(raw["format"], "agy-pool-encrypted-v1")
+
+        # Test import wrong password
+        buf = io.StringIO()
+        with mock.patch("sys.stderr", buf):
+            res = agy_pool.import_pool(enc_file, password="badpass")
+        self.assertFalse(res)
+
+        # Test import correct password
+        self.save_accounts([])
+        res = agy_pool.import_pool(enc_file, password="mypassword")
+        self.assertTrue(res)
+        self.assertEqual(len(agy_pool.load_pool()["accounts"]), 1)
+
+    def test_import_merge_and_skip_existing(self):
+        acc1 = account("a", token="old-token")
+        acc1["name"] = "Alice Old"
+        self.save_accounts([acc1])
+
+        backup_accounts = [
+            {
+                "email": "a@example.test",
+                "name": "Alice Updated",
+                "refresh_token": "new-refresh-a",
+                "access_token": "new-token-a",
+                "token_expiry": time.time() + 7200,
+            },
+            {
+                "email": "b@example.test",
+                "name": "Bob",
+                "refresh_token": "refresh-b",
+            }
+        ]
+        backup_file = os.path.join(self.temp.name, "merge_backup.json")
+        with open(backup_file, "w", encoding="utf-8") as f:
+            json.dump({"version": 1, "accounts": backup_accounts}, f)
+
+        agy_pool.import_pool(backup_file)
+        pool = agy_pool.load_pool()["accounts"]
+        self.assertEqual(len(pool), 2)
+        acc_a = next(a for a in pool if a["email"] == "a@example.test")
+        self.assertEqual(acc_a["refresh_token"], "new-refresh-a")
+        self.assertEqual(acc_a["access_token"], "new-token-a")
+
+        # Test skip-existing
+        backup_accounts[0]["refresh_token"] = "should-not-apply"
+        with open(backup_file, "w", encoding="utf-8") as f:
+            json.dump({"version": 1, "accounts": backup_accounts}, f)
+        agy_pool.import_pool(backup_file, skip_existing=True)
+        pool = agy_pool.load_pool()["accounts"]
+        acc_a = next(a for a in pool if a["email"] == "a@example.test")
+        self.assertEqual(acc_a["refresh_token"], "new-refresh-a")
 
 
 if __name__ == "__main__":

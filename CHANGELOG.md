@@ -5,6 +5,21 @@ All notable changes to the `agy-pool` project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.0-alpha7] - 2026-09-15
+
+### Added
+- **Cross-Device Account Pool Backup & Migration (`export` / `import`)**:
+  - `agy-pool export`: Dumps all accounts, OAuth refresh tokens, active credential designation, and scheduler configurations to an atomic JSON backup file (strictly enforcing `0600` permissions).
+  - `agy-pool import`: Ingests backup files into local pool storage with automatic account deduplication and non-destructive merging (updates existing tokens and appends new accounts).
+  - Supports `--replace` to overwrite local pool entirely, and `--skip-existing` to protect existing local tokens.
+  - Supports standard input/output streaming (`-`) allowing direct pipeline migration over SSH (`ssh remote agy-pool export - | agy-pool import -`).
+- **Zero-Dependency Authenticated Passphrase Encryption**:
+  - Implemented standard-library-only authenticated encryption for backup bundles via PBKDF2-HMAC-SHA256 (100,000 rounds) key derivation, HMAC-SHA256 CTR stream cipher, and Encrypt-then-MAC authentication tag verification.
+  - Securely encrypts sensitive OAuth tokens with `agy-pool export -e` (or `-p / --password`), preventing plaintext credential leakage when backups are transferred across unsecure media.
+  - Automatically identifies encrypted backups on `agy-pool import` and securely prompts for passphrase.
+- **Comprehensive Unit Testing**:
+  - Added 4 test suites in `tests/test_agy_pool.py` covering cryptographic round-trips, tampering detection, merge/replace conflict handling, and Unix permissions (35 tests total).
+
 ## [0.1.0-alpha6] - 2026-09-15
 
 ### Added
