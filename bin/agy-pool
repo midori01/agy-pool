@@ -36,7 +36,7 @@ except ImportError:
     HAS_FCNTL = False
 
 # ----------------- Constants & Configuration -----------------
-VERSION = "0.1.0-alpha5"
+VERSION = "0.1.0-alpha6"
 def _decode_cred(h, k=0x5A):
     return bytes([b ^ k for b in bytes.fromhex(h)]).decode()
 
@@ -822,7 +822,7 @@ def do_login():
             return dict(existing)
         created[0] = True
         entry = dict(account_data, id=_next_account_id(pool["accounts"]), request_count=0,
-                     error_count=0, created_at=int(time.time()), last_quota={})
+                     gen_count=0, error_count=0, created_at=int(time.time()), last_quota={})
         pool["accounts"].append(entry)
         if not pool.get("active_account_id"):
             pool["active_account_id"] = entry["id"]
@@ -885,7 +885,7 @@ def import_current():
                 existing.update(account_data)
                 return dict(existing)
             acc = dict(account_data, id=_next_account_id(pool["accounts"]), request_count=0,
-                       error_count=0, created_at=int(time.time()), last_quota={})
+                       gen_count=0, error_count=0, created_at=int(time.time()), last_quota={})
             pool["accounts"].append(acc)
             if not pool.get("active_account_id"):
                 pool["active_account_id"] = acc["id"]
@@ -1000,15 +1000,24 @@ def list_accounts():
         g5_bar = render_progress_bar(g5_frac, width=10)
         gw_bar = render_progress_bar(gw_frac, width=10)
 
-        hits = acc.get("request_count", 0)
+        now_ts = time.time()
+        is_cooling = acc.get("rate_limited_until", 0) > now_ts
+        is_exhausted = (g5_frac <= 0.005) or (gw_frac <= 0.005)
+
+        hits = acc.get("gen_count", acc.get("request_count", 0))
+
         if status == "validation_required":
             marker = f"{CLR_YELLOW}⚠ Verify Required{CLR_RESET}"
         elif status == "auth_error":
             marker = f"{CLR_RED}✖ Auth Error{CLR_RESET}"
+        elif is_cooling:
+            marker = f"{CLR_YELLOW}* Active (Cooldown){CLR_RESET}" if is_active else f"{CLR_YELLOW}Cooldown{CLR_RESET}"
+        elif is_exhausted:
+            marker = f"{CLR_RED}* Active (Exhausted){CLR_RESET}" if is_active else f"{CLR_DIM}Exhausted{CLR_RESET}"
         elif is_active:
             marker = f"{CLR_GREEN}* Active{CLR_RESET}"
         else:
-            marker = f"{CLR_DIM}Idle{CLR_RESET}"
+            marker = f"{CLR_CYAN}Ready{CLR_RESET}"
         name_str = f" ({name})" if name and name != email else ""
 
         print(f"{CLR_BOLD}[{i}] {email}{name_str}{CLR_RESET}  [{marker}]  Hits: {hits}")
@@ -1035,7 +1044,9 @@ def list_accounts():
             print()
 
     print(sub_sep)
-    print(f"Strategy: {CLR_BOLD}{pool.get('strategy', 'max_quota')}{CLR_RESET} | Gateway Proxy: {gateway_status}")
+    print(f" {CLR_GREEN}[* Active]{CLR_RESET} {CLR_DIM}CLI Base Token{CLR_RESET}    {CLR_CYAN}[Ready]{CLR_RESET} {CLR_DIM}In Rotation Pool{CLR_RESET}")
+    print(f" {CLR_YELLOW}[Cooldown]{CLR_RESET} {CLR_DIM}Rate Limited{CLR_RESET}      {CLR_DIM}[Exhausted] Quota Depleted{CLR_RESET}")
+    print(f" Strategy: {CLR_BOLD}{pool.get('strategy', 'max_quota')}{CLR_RESET} | Gateway Proxy: {gateway_status}")
     print(sep + "\n")
 
 
@@ -1569,12 +1580,14 @@ class SmartProxyHandler(http.server.BaseHTTPRequestHandler):
             sys.stderr.write(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [STREAM TRUNCATED] {e}\n")
             sys.stderr.flush()
 
-    def _record_success(self, account):
+    def _record_success(self, account, is_generation=False):
         def update(pool):
             stored = _find_account(pool, account)
             if not stored:
                 return
             stored["request_count"] = stored.get("request_count", 0) + 1
+            if is_generation:
+                stored["gen_count"] = stored.get("gen_count", 0) + 1
             if stored.get("status") in ("validation_required", "auth_error"):
                 stored.pop("status", None)
                 stored.pop("validation_url", None)
@@ -1661,8 +1674,8 @@ class SmartProxyHandler(http.server.BaseHTTPRequestHandler):
                 except (ValueError, TypeError):
                     f = 1.0
                 if f <= 0.005:
-                    return (0, f, -acc.get("request_count", 0))
-                return (1, round(f, 2), -acc.get("request_count", 0))
+                    return (0, f, -acc.get("gen_count", acc.get("request_count", 0)))
+                return (1, round(f, 2), -acc.get("gen_count", acc.get("request_count", 0)))
 
             candidates.sort(key=sort_key, reverse=True)
         else:
@@ -1713,11 +1726,11 @@ class SmartProxyHandler(http.server.BaseHTTPRequestHandler):
                     is_stream = is_sse or ("text/event-stream" in resp_content_type)
 
                     if is_stream:
-                        self._record_success(acc)
+                        self._record_success(acc, is_generation=is_generation)
                         self._send_stream(status, resp.headers, resp)
                     else:
                         resp_body = resp.read()
-                        self._record_success(acc)
+                        self._record_success(acc, is_generation=is_generation)
                         try:
                             self._send_buffered(status, resp.headers, resp_body)
                         except (BrokenPipeError, ConnectionResetError):

@@ -4,6 +4,7 @@ import http.client
 import http.server
 import importlib.machinery
 import importlib.util
+import io
 import json
 import multiprocessing
 import os
@@ -511,9 +512,24 @@ class AgyPoolTest(unittest.TestCase):
             thread.join()
         self.assertEqual(results, [200, 200])
         self.assertEqual(agy_pool.load_pool()["accounts"][0]["request_count"], 2)
+        self.assertEqual(agy_pool.load_pool()["accounts"][0]["gen_count"], 2)
         with open(agy_pool.AGY_TOKEN_FILE, "rb") as token_file:
             self.assertEqual(token_file.read(), before)
         self.assertEqual(os.stat(agy_pool.AGY_TOKEN_FILE).st_mode & 0o777, 0o600)
+
+    def test_generation_vs_metadata_request_counts(self):
+        self.save_accounts([account("a")])
+        scenario = Scenario({"token-a": [(200, b"gen", {}), (200, b"meta", {})]})
+        proxy = self.start_proxy(scenario)
+        self.request(proxy, "/v1internal:generateContent")
+        acc = agy_pool.load_pool()["accounts"][0]
+        self.assertEqual(acc.get("gen_count"), 1)
+        self.assertEqual(acc.get("request_count"), 1)
+
+        self.request(proxy, "/v1internal:fetchUserInfo")
+        acc = agy_pool.load_pool()["accounts"][0]
+        self.assertEqual(acc.get("gen_count"), 1)
+        self.assertEqual(acc.get("request_count"), 2)
 
     def test_active_switch_does_not_change_in_flight_account(self):
         self.save_accounts([account("a"), account("b")])
@@ -688,6 +704,44 @@ class AgyPoolTest(unittest.TestCase):
 
                 agy_pool.show_logs(clear=True)
                 self.assertFalse(os.path.exists(log_path + ".1"))
+
+    def test_list_accounts_exhausted_and_hits(self):
+        acc1 = account("a")
+        acc1["gen_count"] = 42
+        acc1["request_count"] = 100
+        acc1["last_quota"] = {
+            "gemini_5h": {"fraction": 0.8},
+            "gemini_weekly": {"fraction": 0.9},
+        }
+
+        acc2 = account("b")
+        acc2["gen_count"] = 15
+        acc2["request_count"] = 30
+        acc2["last_quota"] = {
+            "gemini_5h": {"fraction": 1.0},
+            "gemini_weekly": {"fraction": 0.0},
+        }
+
+        acc3 = account("c")
+        acc3["rate_limited_until"] = time.time() + 300  # Cooldown
+
+        self.save_accounts([acc1, acc2, acc3])
+        buf = io.StringIO()
+        with mock.patch("sys.stdout", buf), \
+             mock.patch.object(agy_pool, "get_daemon_pid", return_value=None), \
+             mock.patch.object(agy_pool, "_safe_quota"):
+            agy_pool.list_accounts()
+        output = buf.getvalue()
+        self.assertIn("* Active", output)
+        self.assertIn("Hits: 42", output)
+        self.assertIn("Exhausted", output)
+        self.assertIn("Hits: 15", output)
+        self.assertIn("Cooldown", output)
+        self.assertIn("Hits: 0", output)
+        self.assertIn("CLI Base Token", output)
+        self.assertIn("In Rotation Pool", output)
+        self.assertNotIn("Total:", output)
+        self.assertNotIn("AI Gen:", output)
 
 
 if __name__ == "__main__":

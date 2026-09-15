@@ -5,6 +5,19 @@ All notable changes to the `agy-pool` project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.0-alpha6] - 2026-09-15
+
+### Added
+- **Pure AI Generation Metric Tracking (`Hits`)**:
+  - Differentiates between actual model reasoning/generation requests (`streamGenerateContent`, `generateContent`) and lightweight control-plane metadata calls (`listExperiments`, `loadCodeAssist`, `fetchUserInfo`, etc.).
+  - Tracks `gen_count` separately from overall `request_count`, displaying pure inference calls under `Hits: <N>` in the dashboard to eliminate confusion and quota ambiguity.
+- **Generation-Aware Dynamic Load Balancing**:
+  - Generation request scheduler now breaks quota ties using actual AI generation count (`gen_count`) rather than raw request count, ensuring fairer compute balancing.
+- **Accurate Status Indicators & Quota Exhaustion Detection**:
+  - Automatically identifies depleted quota (`g5_frac <= 0.005` or `gw_frac <= 0.005`) and marks accounts as `[Exhausted]` (or `* Active (Exhausted)` for active compatibility base) instead of misleading `[Ready]`.
+  - Accurately reflects temporary rate limits with `[Cooldown]`.
+  - Added mobile-optimized 2x2 badge legend: `[* Active] CLI Base Token`, `[Ready] In Rotation Pool`, `[Cooldown] Rate Limited`, `[Exhausted] Quota Depleted`.
+
 ## [0.1.0-alpha5] - 2026-09-14
 
 ### Added
