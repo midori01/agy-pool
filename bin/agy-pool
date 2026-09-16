@@ -39,7 +39,7 @@ except ImportError:
     HAS_FCNTL = False
 
 # ----------------- Constants & Configuration -----------------
-VERSION = "0.1.0-alpha8"
+VERSION = "0.1.0-alpha9"
 def _decode_cred(h, k=0x5A):
     return bytes([b ^ k for b in bytes.fromhex(h)]).decode()
 
@@ -2082,13 +2082,7 @@ class SmartProxyHandler(http.server.BaseHTTPRequestHandler):
                 last_error = e
                 sys.stderr.write(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [PROXY EXCEPTION] {self.command} {path.split('/')[-1]} -> {acc.get('email')}: {e}\n")
                 sys.stderr.flush()
-                try:
-                    self.close_connection = True
-                    self.send_error(504 if _is_timeout_error(e) else 502,
-                                    "Upstream request failed")
-                except (BrokenPipeError, ConnectionResetError):
-                    pass
-                return
+                continue
 
         # If all candidates exhausted
         sys.stderr.write(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [ALL EXHAUSTED] {self.command} {path.split('/')[-1]} failed across all accounts: {last_error}\n")

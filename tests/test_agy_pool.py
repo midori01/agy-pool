@@ -423,9 +423,9 @@ class AgyPoolTest(unittest.TestCase):
             handler.close_connection = True
 
         proxy = self.start_proxy(Scenario({"token-a": [malformed]}))
-        self.assertEqual(self.request(proxy)[0], 502)
+        self.assertEqual(self.request(proxy)[0], 503)
 
-    def test_upstream_timeout_returns_504_without_replay(self):
+    def test_upstream_timeout_fails_over_to_next_account(self):
         self.save_accounts([account("a"), account("b")])
         proxy = self.start_server(agy_pool.SmartProxyHandler)
         calls = []
@@ -435,8 +435,8 @@ class AgyPoolTest(unittest.TestCase):
             raise socket.timeout("timed out")
 
         with mock.patch.object(agy_pool.urllib.request, "urlopen", timeout):
-            self.assertEqual(self.request(proxy)[0], 504)
-        self.assertEqual(len(calls), 1)
+            self.assertEqual(self.request(proxy)[0], 503)
+        self.assertEqual(len(calls), 2)
 
     def test_malformed_client_chunking_is_rejected(self):
         self.save_accounts([account("a")])
