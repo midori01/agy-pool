@@ -93,16 +93,29 @@ class AgyPoolTest(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
-        self.home_patch = mock.patch.dict(os.environ, {"HOME": self.temp.name})
-        self.home_patch.start()
-        self.addCleanup(self.home_patch.stop)
         gemini = os.path.join(self.temp.name, ".gemini")
-        agy_pool.GEMINI_DIR = gemini
-        agy_pool.POOL_CONFIG_FILE = os.path.join(gemini, "agy-pool-accounts.json")
-        agy_pool.PID_FILE = os.path.join(gemini, "agy-pool.pid")
-        agy_pool.LOG_FILE = os.path.join(gemini, "agy-pool.log")
-        agy_pool.AGY_CLI_DIR = os.path.join(gemini, "antigravity-cli")
-        agy_pool.AGY_TOKEN_FILE = os.path.join(agy_pool.AGY_CLI_DIR, "antigravity-oauth-token")
+
+        # Capture prior state before configuring isolated environment
+        orig_gemini_dir = agy_pool.GEMINI_DIR
+        orig_test_mode = agy_pool.is_test_mode()
+
+        self.env_patch = mock.patch.dict(os.environ, {
+            "HOME": self.temp.name,
+            "AGY_GEMINI_DIR": gemini,
+            "AGY_TEST_MODE": "1",
+        })
+        self.env_patch.start()
+        self.addCleanup(self.env_patch.stop)
+
+        # Explicitly configure isolated storage paths and enable fail-closed test guard
+        agy_pool.configure_paths(gemini)
+        agy_pool.set_test_mode(True)
+
+        def _restore_state():
+            agy_pool.set_test_mode(orig_test_mode)
+            agy_pool.configure_paths(orig_gemini_dir)
+        self.addCleanup(_restore_state)
+
         agy_pool.FILE_LOCKS.clear()
 
     def save_accounts(self, accounts, active="a"):
@@ -914,6 +927,292 @@ class AgyPoolTest(unittest.TestCase):
              mock.patch("sys.stdout", buf):
             agy_pool.main()
         self.assertIn(f"agy-pool {agy_pool.VERSION}", buf.getvalue())
+
+    def test_production_pool_path_isolation_and_fail_closed_guard(self):
+        """
+        Regression test: Verify that all pool state operations are strictly
+        redirected to isolated test paths, a sentinel file in a protected location
+        remains completely untouched, and direct writes to forbidden paths raise
+        RuntimeError in test mode.
+        """
+        with tempfile.TemporaryDirectory() as protected_dir:
+            sentinel_path = os.path.join(protected_dir, "agy-pool-accounts.json")
+            sentinel_payload = {"version": 1, "accounts": [{"id": "protected_account", "email": "protected@example.com"}]}
+            with open(sentinel_path, "w", encoding="utf-8") as f:
+                json.dump(sentinel_payload, f)
+            initial_mtime = os.path.getmtime(sentinel_path)
+
+            agy_pool.register_forbidden_path(protected_dir)
+
+            # 1. Perform writes using the standard test harness
+            self.save_accounts([account("isolated_1"), account("isolated_2")], active="isolated_1")
+            agy_pool.pool_transaction(lambda p: p["accounts"].append(account("isolated_3")))
+
+            # Verify isolated pool got updated inside self.temp.name
+            pool = agy_pool.load_pool()
+            self.assertEqual(len(pool["accounts"]), 3)
+            self.assertEqual([a["id"] for a in pool["accounts"]], ["isolated_1", "isolated_2", "isolated_3"])
+            self.assertTrue(agy_pool.POOL_CONFIG_FILE.startswith(self.temp.name))
+
+            # Verify sentinel is 100% untouched
+            with open(sentinel_path, "r", encoding="utf-8") as f:
+                sentinel_after = json.load(f)
+            self.assertEqual(sentinel_after, sentinel_payload)
+            self.assertEqual(os.path.getmtime(sentinel_path), initial_mtime)
+
+            # 2. Verify fail-closed guard prevents writing to protected paths
+            with self.assertRaises(RuntimeError) as cm_write:
+                agy_pool._atomic_json_write(sentinel_path, {"hacked": True})
+            self.assertIn("[FAIL-CLOSED TEST GUARD]", str(cm_write.exception))
+
+            # Verify fail-closed guard prevents acquiring lock in protected path
+            with self.assertRaises(RuntimeError) as cm_lock:
+                with agy_pool._file_lock(os.path.join(protected_dir, "test.lock")):
+                    pass
+            self.assertIn("[FAIL-CLOSED TEST GUARD]", str(cm_lock.exception))
+
+            # Verify fail-closed guard prevents log rotation / clear on protected path
+            with self.assertRaises(RuntimeError) as cm_log:
+                agy_pool.rotate_log_if_needed(os.path.join(protected_dir, "test.log"), force=True)
+            self.assertIn("[FAIL-CLOSED TEST GUARD]", str(cm_log.exception))
+
+            with self.assertRaises(RuntimeError) as cm_clear:
+                agy_pool.clear_log(os.path.join(protected_dir, "test.log"))
+            self.assertIn("[FAIL-CLOSED TEST GUARD]", str(cm_clear.exception))
+
+            # Verify fail-closed guard prevents configuring paths to protected path
+            with self.assertRaises(RuntimeError) as cm_cfg:
+                agy_pool.configure_paths(protected_dir)
+            self.assertIn("[FAIL-CLOSED TEST GUARD]", str(cm_cfg.exception))
+
+            # Verify fail-closed guard strictly protects production GEMINI_DIR
+            with self.assertRaises(RuntimeError) as cm_prod:
+                agy_pool._assert_safe_write_path(
+                    os.path.join(agy_pool._REAL_PRODUCTION_GEMINI_DIR, "agy-pool-accounts.json")
+                )
+            self.assertIn("[FAIL-CLOSED TEST GUARD]", str(cm_prod.exception))
+
+            # Verify sentinel was still never modified
+            with open(sentinel_path, "r", encoding="utf-8") as f:
+                self.assertEqual(json.load(f), sentinel_payload)
+
+    def test_pid_deletion_fail_closed_guard_and_path_resolution_errors(self):
+        """
+        Regression test: Verify that PID deletion operations (unlink, remove) are
+        blocked in test mode when targeting protected directories, path normalization
+        failures fail closed, temporary writes succeed, and production mode is unaffected.
+        """
+        with tempfile.TemporaryDirectory() as protected_dir:
+            agy_pool.register_forbidden_path(protected_dir)
+            protected_pid = os.path.join(protected_dir, "agy-pool.pid")
+            with open(protected_pid, "w", encoding="utf-8") as f:
+                json.dump({"pid": os.getpid()}, f)
+
+            # A. PID unlink is blocked in test mode when PID_FILE resolves inside a protected directory.
+            with mock.patch.object(agy_pool, "PID_FILE", protected_pid):
+                with self.assertRaises(RuntimeError) as cm_unlink:
+                    with open(agy_pool.PID_FILE, "r", encoding="utf-8") as f:
+                        raw = f.read().strip()
+                    file_pid = int(json.loads(raw).get("pid", 0))
+                    if file_pid == os.getpid():
+                        agy_pool._assert_safe_write_path(agy_pool.PID_FILE)
+                        os.unlink(agy_pool.PID_FILE)
+                self.assertIn("[FAIL-CLOSED TEST GUARD]", str(cm_unlink.exception))
+                self.assertTrue(os.path.exists(protected_pid))
+
+            # B. PID remove is blocked in test mode when PID_FILE resolves inside a protected directory.
+            with mock.patch.object(agy_pool, "PID_FILE", protected_pid), \
+                 mock.patch.object(agy_pool, "get_daemon_pid", side_effect=[99999, None]):
+                with self.assertRaises(RuntimeError) as cm_remove:
+                    agy_pool.stop_proxy_daemon()
+                self.assertIn("[FAIL-CLOSED TEST GUARD]", str(cm_remove.exception))
+                self.assertTrue(os.path.exists(protected_pid))
+
+        # C. If path normalization/resolution raises an exception while test mode is active,
+        # _assert_safe_write_path() raises RuntimeError.
+        with mock.patch("os.path.realpath", side_effect=OSError("disk read failure")):
+            with self.assertRaises(RuntimeError) as cm_exc:
+                agy_pool._assert_safe_write_path("/some/temp/path.json")
+            self.assertIn("[FAIL-CLOSED TEST GUARD] Failed to resolve path safely", str(cm_exc.exception))
+
+        # D. Existing valid temporary-state writes still succeed.
+        temp_file = os.path.join(self.temp.name, "valid_temp.json")
+        agy_pool._atomic_json_write(temp_file, {"valid": True})
+        self.assertTrue(os.path.exists(temp_file))
+        with open(temp_file, "r", encoding="utf-8") as f:
+            self.assertEqual(json.load(f), {"valid": True})
+        agy_pool._assert_safe_write_path(temp_file)
+
+        # E. Production-mode behavior remains unchanged when AGY_TEST_MODE is unset/false.
+        agy_pool.set_test_mode(False)
+        try:
+            agy_pool._assert_safe_write_path(agy_pool._REAL_PRODUCTION_GEMINI_DIR)
+            with mock.patch("os.path.realpath", side_effect=OSError("production-mode realpath error")):
+                agy_pool._assert_safe_write_path("/any/path")
+        finally:
+            agy_pool.set_test_mode(True)
+
+    def test_production_gemini_dir_detection_independent_of_home(self):
+        """Verify production home is derived independently of mutable HOME, protecting production while allowing isolated test paths."""
+        # 1. Overridden HOME does not change real production home
+        with mock.patch.dict(os.environ, {"HOME": "/tmp/test-home"}):
+            detected = agy_pool._detect_real_production_gemini_dir()
+            self.assertFalse(detected.startswith("/tmp/test-home"))
+            fake_pw = mock.Mock(pw_dir="/home/mockuser")
+            with mock.patch("pwd.getpwuid", return_value=fake_pw):
+                mock_detected = agy_pool._detect_real_production_gemini_dir()
+                self.assertEqual(mock_detected, "/home/mockuser/.gemini")
+
+        # Fallback when pwd is unavailable
+        with mock.patch.dict(os.environ, {"HOME": "/home/fallbackuser"}, clear=False), \
+             mock.patch.dict("sys.modules", {"pwd": None}):
+            fallback_detected = agy_pool._detect_real_production_gemini_dir()
+            self.assertTrue(fallback_detected.endswith(".gemini"))
+
+        # 2. Isolated AGY_GEMINI_DIR remains writable in test mode
+        self.assertTrue(agy_pool.is_test_mode())
+        isolated_dir = os.path.join(self.temp.name, "isolated_home", ".gemini")
+        os.makedirs(isolated_dir, mode=0o700, exist_ok=True)
+        isolated_file = os.path.join(isolated_dir, "test.json")
+        agy_pool._assert_safe_write_path(isolated_file)
+        agy_pool._atomic_json_write(isolated_file, {"isolated": True})
+        self.assertTrue(os.path.exists(isolated_file))
+
+        # 3. Actual OS-user ~/.gemini remains blocked
+        prod_gemini = agy_pool._REAL_PRODUCTION_GEMINI_DIR
+        with self.assertRaises(RuntimeError) as cm_prod:
+            agy_pool._assert_safe_write_path(prod_gemini)
+        self.assertIn("[FAIL-CLOSED TEST GUARD]", str(cm_prod.exception))
+
+        with self.assertRaises(RuntimeError) as cm_prod_file:
+            agy_pool._assert_safe_write_path(os.path.join(prod_gemini, "agy-pool-accounts.json"))
+        self.assertIn("[FAIL-CLOSED TEST GUARD]", str(cm_prod_file.exception))
+
+        # 4. Symlink into production remains blocked
+        symlink_to_prod = os.path.join(self.temp.name, "symlink_to_production")
+        if os.path.exists(symlink_to_prod):
+            os.unlink(symlink_to_prod)
+        os.symlink(prod_gemini, symlink_to_prod)
+        with self.assertRaises(RuntimeError) as cm_sym:
+            agy_pool._assert_safe_write_path(os.path.join(symlink_to_prod, "accounts.json"))
+        self.assertIn("[FAIL-CLOSED TEST GUARD]", str(cm_sym.exception))
+        with self.assertRaises(RuntimeError) as cm_sym_dir:
+            agy_pool._assert_safe_write_path(symlink_to_prod)
+        self.assertIn("[FAIL-CLOSED TEST GUARD]", str(cm_sym_dir.exception))
+
+        # 5. Prefix collision such as ~/.gemini-backup is not falsely blocked
+        parent_dir = os.path.dirname(prod_gemini)
+        prefix_backup = os.path.join(parent_dir, ".gemini-backup")
+        prefix_file = os.path.join(prefix_backup, "backup.json")
+        try:
+            agy_pool._assert_safe_write_path(prefix_file)
+            agy_pool._assert_safe_write_path(prefix_backup)
+        except RuntimeError as e:
+            self.fail(f"Prefix collision was falsely blocked: {e}")
+
+        # 6. Test cleanup can restore configure_paths() to its original isolated temporary path without RuntimeError
+        temp_outer = os.path.join(self.temp.name, "outer_temp_gemini")
+        temp_inner = os.path.join(self.temp.name, "inner_temp_gemini")
+        agy_pool.configure_paths(temp_outer)
+        self.assertEqual(agy_pool.GEMINI_DIR, temp_outer)
+        agy_pool.configure_paths(temp_inner)
+        self.assertEqual(agy_pool.GEMINI_DIR, temp_inner)
+        agy_pool.configure_paths(temp_outer)
+        self.assertEqual(agy_pool.GEMINI_DIR, temp_outer)
+        agy_pool.configure_paths(os.path.join(self.temp.name, ".gemini"))
+
+    def test_installer_and_upgrade_lifecycle(self):
+        """
+        Installer / upgrade gate:
+        - Fresh install
+        - Upgrade over existing install (idempotent, no duplicate aliases)
+        - Uninstall (cleans binaries & aliases, preserves pool data)
+        - Reinstall
+        """
+        fake_home = os.path.join(self.temp.name, "fake_home")
+        os.makedirs(fake_home, exist_ok=True)
+        bashrc = os.path.join(fake_home, ".bashrc")
+        with open(bashrc, "w", encoding="utf-8") as f:
+            f.write("# existing bashrc content\nexport FOO=bar\n")
+
+        fake_prefix = os.path.join(fake_home, ".local")
+        bin_dir = os.path.join(fake_prefix, "bin")
+        os.makedirs(bin_dir, exist_ok=True)
+
+        # Confirm fake HOME contains no native Antigravity credential file
+        gemini_token_dir = os.path.join(fake_home, ".gemini", "antigravity-cli")
+        self.assertFalse(os.path.exists(os.path.join(gemini_token_dir, "antigravity-oauth-token")))
+
+        # Create dummy pool data before install
+        gemini_dir = os.path.join(fake_home, ".gemini")
+        os.makedirs(gemini_dir, exist_ok=True)
+        pool_file = os.path.join(gemini_dir, "agy-pool-accounts.json")
+        with open(pool_file, "w", encoding="utf-8") as f:
+            json.dump({"version": 1, "accounts": [{"id": "acc_keep", "email": "keep@example.com"}]}, f)
+
+        repo_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        install_script = os.path.join(repo_dir, "install.sh")
+        uninstall_script = os.path.join(repo_dir, "uninstall.sh")
+
+        env = dict(os.environ, HOME=fake_home, PREFIX=fake_prefix)
+        # 1. Fresh install
+        proc = subprocess.run(["bash", install_script], env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        self.assertEqual(proc.returncode, 0, f"install.sh failed: {proc.stderr}")
+
+        self.assertTrue(os.path.islink(os.path.join(bin_dir, "agy-pool")))
+        self.assertTrue(os.path.islink(os.path.join(bin_dir, "agy-raw")))
+        self.assertTrue(os.path.islink(os.path.join(bin_dir, "agy-orig")))
+
+        with open(bashrc, "r", encoding="utf-8") as f:
+            bashrc_content = f.read()
+        self.assertIn("# >>> agy-pool integration >>>", bashrc_content)
+        self.assertIn("alias agy='agy-pool run'", bashrc_content)
+
+        # 2. Upgrade / Reinstall over existing installation (must be idempotent)
+        proc_up = subprocess.run(["bash", install_script], env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        self.assertEqual(proc_up.returncode, 0, f"install.sh upgrade failed: {proc_up.stderr}")
+
+        with open(bashrc, "r", encoding="utf-8") as f:
+            bashrc_up = f.read()
+        # Ensure duplicate alias blocks are never appended
+        self.assertEqual(bashrc_up.count("# >>> agy-pool integration >>>"), 1)
+
+        # 3. Uninstall (must remove links & shell integration, but PRESERVE pool data)
+        proc_un = subprocess.run(["bash", uninstall_script], env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        self.assertEqual(proc_un.returncode, 0, f"uninstall.sh failed: {proc_un.stderr}")
+
+        self.assertFalse(os.path.exists(os.path.join(bin_dir, "agy-pool")))
+        self.assertFalse(os.path.exists(os.path.join(bin_dir, "agy-raw")))
+        self.assertFalse(os.path.exists(os.path.join(bin_dir, "agy-orig")))
+
+        with open(bashrc, "r", encoding="utf-8") as f:
+            bashrc_un = f.read()
+        self.assertNotIn("# >>> agy-pool integration >>>", bashrc_un)
+        self.assertNotIn("alias agy='agy-pool run'", bashrc_un)
+        self.assertIn("export FOO=bar", bashrc_un)
+
+        # Pool file must be preserved
+        self.assertTrue(os.path.exists(pool_file))
+        with open(pool_file, "r", encoding="utf-8") as f:
+            self.assertEqual(json.load(f)["accounts"][0]["id"], "acc_keep")
+
+        # 4. Reinstall
+        proc_re = subprocess.run(["bash", install_script], env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        self.assertEqual(proc_re.returncode, 0, f"install.sh reinstall failed: {proc_re.stderr}")
+
+        self.assertTrue(os.path.islink(os.path.join(bin_dir, "agy-pool")))
+        self.assertTrue(os.path.islink(os.path.join(bin_dir, "agy-raw")))
+        self.assertTrue(os.path.islink(os.path.join(bin_dir, "agy-orig")))
+
+        with open(bashrc, "r", encoding="utf-8") as f:
+            bashrc_re = f.read()
+        self.assertEqual(bashrc_re.count("# >>> agy-pool integration >>>"), 1)
+        self.assertIn("alias agy='agy-pool run'", bashrc_re)
+
+        # Pool file must still be preserved after reinstall
+        self.assertTrue(os.path.exists(pool_file))
+        with open(pool_file, "r", encoding="utf-8") as f:
+            self.assertEqual(json.load(f)["accounts"][0]["id"], "acc_keep")
 
 
 if __name__ == "__main__":
