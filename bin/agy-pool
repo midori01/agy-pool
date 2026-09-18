@@ -1855,6 +1855,118 @@ def _is_uncommitted_transport_error(error):
     return False
 
 
+def _get_remaining_fraction(acc):
+    q = acc.get("last_quota", {})
+    raw_f = q.get("remaining_fraction")
+    try:
+        return float(raw_f) if raw_f is not None else 1.0
+    except (ValueError, TypeError):
+        return 1.0
+
+
+def order_candidates(candidates, strategy="max_quota", pool=None, now=None):
+    """
+    Orders account candidates for AI generation according to the chosen load balancing strategy.
+
+    Tiers:
+      1. Eligible accounts: healthy quota (> 0.005), not rate-limited, not restricted.
+      2. Depleted accounts: quota <= 0.005, not rate-limited, not restricted.
+      3. Cooldown accounts: rate_limited_until > now.
+      4. Restricted accounts: validation_required or auth_error.
+
+    Strategies applied strictly to the eligible account set:
+      - max_quota: Highest remaining fraction (binned by 0.01), breaking ties by lowest hits.
+      - least_used: Lowest generation count (Hits), breaking ties by highest quota, then account ID.
+      - round_robin: Sequential rotation starting after round_robin_last_account_id, wrapping around.
+
+    Depleted, cooldown, and restricted tiers follow behind in stable fallback order.
+    """
+    if now is None:
+        now = time.time()
+    if pool is None:
+        pool = {}
+
+    eligible = []
+    depleted = []
+    cooldown = []
+    restricted = []
+
+    for acc in candidates:
+        status = acc.get("status")
+        if status in ("validation_required", "auth_error"):
+            restricted.append(acc)
+        elif acc.get("rate_limited_until", 0) > now:
+            cooldown.append(acc)
+        else:
+            f = _get_remaining_fraction(acc)
+            if f <= 0.005:
+                depleted.append(acc)
+            else:
+                eligible.append(acc)
+
+    # Strategy ordering on eligible accounts
+    if strategy == "least_used":
+        # Lowest hits first, tie-break by higher remaining fraction, then account ID
+        eligible.sort(key=lambda a: (
+            a.get("gen_count", a.get("request_count", 0)),
+            -round(_get_remaining_fraction(a), 2),
+            a.get("id", "")
+        ))
+    elif strategy == "round_robin":
+        # Rotate starting after round_robin_last_account_id
+        last_id = pool.get("round_robin_last_account_id")
+        if last_id and any(a.get("id") == last_id for a in eligible):
+            idx = next(i for i, a in enumerate(eligible) if a.get("id") == last_id)
+            eligible = eligible[idx + 1:] + eligible[:idx + 1]
+    else:
+        # Default: max_quota (behaviorally identical to pre-alpha9)
+        eligible.sort(key=lambda a: (
+            round(_get_remaining_fraction(a), 2),
+            -a.get("gen_count", a.get("request_count", 0))
+        ), reverse=True)
+
+    # Secondary tiers ordering
+    depleted.sort(key=lambda a: (
+        _get_remaining_fraction(a),
+        -a.get("gen_count", a.get("request_count", 0))
+    ), reverse=True)
+
+    return eligible + depleted + cooldown + restricted
+
+
+def reserve_round_robin_candidates(now=None):
+    """
+    Atomically select candidate ordering and advance the persisted round_robin cursor
+    under pool_transaction() before upstream network dispatch begins.
+
+    Redefines the persisted cursor from 'last successfully completed account' to
+    'last account reserved/selected for a new generation dispatch' to prevent
+    concurrent generation handlers from reading an unadvanced cursor and selecting
+    the same account.
+    """
+    if now is None:
+        now = time.time()
+
+    def update(pool):
+        accounts = pool.get("accounts", [])
+        if not accounts:
+            return []
+        candidates = order_candidates(accounts, strategy="round_robin", pool=pool, now=now)
+        if candidates and candidates[0].get("id"):
+            pool["round_robin_last_account_id"] = candidates[0]["id"]
+        return [dict(a) for a in candidates]
+
+    return pool_transaction(update)
+
+
+def reserve_round_robin_account(now=None):
+    """
+    Atomically reserve and return the next round-robin account candidate.
+    """
+    candidates = reserve_round_robin_candidates(now=now)
+    return candidates[0] if candidates else None
+
+
 class SmartProxyHandler(http.server.BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
@@ -1987,6 +2099,7 @@ class SmartProxyHandler(http.server.BaseHTTPRequestHandler):
             stored["request_count"] = stored.get("request_count", 0) + 1
             if is_generation:
                 stored["gen_count"] = stored.get("gen_count", 0) + 1
+                stored["last_used_at"] = int(time.time())
             if stored.get("status") in ("validation_required", "auth_error"):
                 stored.pop("status", None)
                 stored.pop("validation_url", None)
@@ -2063,27 +2176,15 @@ class SmartProxyHandler(http.server.BaseHTTPRequestHandler):
             return
 
         # Selection strategy
+        strategy = pool.get("strategy", "max_quota")
         candidates = list(accounts)
         now = time.time()
 
         if is_generation:
-            # Sort candidates: healthy quota first, lowest request hits to distribute load
-            def sort_key(acc):
-                if acc.get("status") in ("validation_required", "auth_error"):
-                    return (-2, 0.0, 0)
-                if acc.get("rate_limited_until", 0) > now:
-                    return (-1, 0.0, 0)
-                q = acc.get("last_quota", {})
-                raw_f = q.get("remaining_fraction")
-                try:
-                    f = float(raw_f) if raw_f is not None else 1.0
-                except (ValueError, TypeError):
-                    f = 1.0
-                if f <= 0.005:
-                    return (0, f, -acc.get("gen_count", acc.get("request_count", 0)))
-                return (1, round(f, 2), -acc.get("gen_count", acc.get("request_count", 0)))
-
-            candidates.sort(key=sort_key, reverse=True)
+            if strategy == "round_robin":
+                candidates = reserve_round_robin_candidates(now=now)
+            else:
+                candidates = order_candidates(candidates, strategy=strategy, pool=pool, now=now)
         else:
             # Non-generation: prefer active account, deprioritize restricted/cooldown accounts
             active_id = pool.get("active_account_id")
