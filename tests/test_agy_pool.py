@@ -1121,6 +1121,99 @@ class AgyPoolTest(unittest.TestCase):
         self.assertEqual(agy_pool.GEMINI_DIR, temp_outer)
         agy_pool.configure_paths(os.path.join(self.temp.name, ".gemini"))
 
+    def test_installer_and_upgrade_lifecycle(self):
+        """
+        Installer / upgrade gate:
+        - Fresh install
+        - Upgrade over existing install (idempotent, no duplicate aliases)
+        - Uninstall (cleans binaries & aliases, preserves pool data)
+        - Reinstall
+        """
+        fake_home = os.path.join(self.temp.name, "fake_home")
+        os.makedirs(fake_home, exist_ok=True)
+        bashrc = os.path.join(fake_home, ".bashrc")
+        with open(bashrc, "w", encoding="utf-8") as f:
+            f.write("# existing bashrc content\nexport FOO=bar\n")
+
+        fake_prefix = os.path.join(fake_home, ".local")
+        bin_dir = os.path.join(fake_prefix, "bin")
+        os.makedirs(bin_dir, exist_ok=True)
+
+        # Confirm fake HOME contains no native Antigravity credential file
+        gemini_token_dir = os.path.join(fake_home, ".gemini", "antigravity-cli")
+        self.assertFalse(os.path.exists(os.path.join(gemini_token_dir, "antigravity-oauth-token")))
+
+        # Create dummy pool data before install
+        gemini_dir = os.path.join(fake_home, ".gemini")
+        os.makedirs(gemini_dir, exist_ok=True)
+        pool_file = os.path.join(gemini_dir, "agy-pool-accounts.json")
+        with open(pool_file, "w", encoding="utf-8") as f:
+            json.dump({"version": 1, "accounts": [{"id": "acc_keep", "email": "keep@example.com"}]}, f)
+
+        repo_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        install_script = os.path.join(repo_dir, "install.sh")
+        uninstall_script = os.path.join(repo_dir, "uninstall.sh")
+
+        env = dict(os.environ, HOME=fake_home, PREFIX=fake_prefix)
+        # 1. Fresh install
+        proc = subprocess.run(["bash", install_script], env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        self.assertEqual(proc.returncode, 0, f"install.sh failed: {proc.stderr}")
+
+        self.assertTrue(os.path.islink(os.path.join(bin_dir, "agy-pool")))
+        self.assertTrue(os.path.islink(os.path.join(bin_dir, "agy-raw")))
+        self.assertTrue(os.path.islink(os.path.join(bin_dir, "agy-orig")))
+
+        with open(bashrc, "r", encoding="utf-8") as f:
+            bashrc_content = f.read()
+        self.assertIn("# >>> agy-pool integration >>>", bashrc_content)
+        self.assertIn("alias agy='agy-pool run'", bashrc_content)
+
+        # 2. Upgrade / Reinstall over existing installation (must be idempotent)
+        proc_up = subprocess.run(["bash", install_script], env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        self.assertEqual(proc_up.returncode, 0, f"install.sh upgrade failed: {proc_up.stderr}")
+
+        with open(bashrc, "r", encoding="utf-8") as f:
+            bashrc_up = f.read()
+        # Ensure duplicate alias blocks are never appended
+        self.assertEqual(bashrc_up.count("# >>> agy-pool integration >>>"), 1)
+
+        # 3. Uninstall (must remove links & shell integration, but PRESERVE pool data)
+        proc_un = subprocess.run(["bash", uninstall_script], env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        self.assertEqual(proc_un.returncode, 0, f"uninstall.sh failed: {proc_un.stderr}")
+
+        self.assertFalse(os.path.exists(os.path.join(bin_dir, "agy-pool")))
+        self.assertFalse(os.path.exists(os.path.join(bin_dir, "agy-raw")))
+        self.assertFalse(os.path.exists(os.path.join(bin_dir, "agy-orig")))
+
+        with open(bashrc, "r", encoding="utf-8") as f:
+            bashrc_un = f.read()
+        self.assertNotIn("# >>> agy-pool integration >>>", bashrc_un)
+        self.assertNotIn("alias agy='agy-pool run'", bashrc_un)
+        self.assertIn("export FOO=bar", bashrc_un)
+
+        # Pool file must be preserved
+        self.assertTrue(os.path.exists(pool_file))
+        with open(pool_file, "r", encoding="utf-8") as f:
+            self.assertEqual(json.load(f)["accounts"][0]["id"], "acc_keep")
+
+        # 4. Reinstall
+        proc_re = subprocess.run(["bash", install_script], env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        self.assertEqual(proc_re.returncode, 0, f"install.sh reinstall failed: {proc_re.stderr}")
+
+        self.assertTrue(os.path.islink(os.path.join(bin_dir, "agy-pool")))
+        self.assertTrue(os.path.islink(os.path.join(bin_dir, "agy-raw")))
+        self.assertTrue(os.path.islink(os.path.join(bin_dir, "agy-orig")))
+
+        with open(bashrc, "r", encoding="utf-8") as f:
+            bashrc_re = f.read()
+        self.assertEqual(bashrc_re.count("# >>> agy-pool integration >>>"), 1)
+        self.assertIn("alias agy='agy-pool run'", bashrc_re)
+
+        # Pool file must still be preserved after reinstall
+        self.assertTrue(os.path.exists(pool_file))
+        with open(pool_file, "r", encoding="utf-8") as f:
+            self.assertEqual(json.load(f)["accounts"][0]["id"], "acc_keep")
+
 
 if __name__ == "__main__":
     unittest.main()
