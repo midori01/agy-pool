@@ -2304,6 +2304,68 @@ class AgyPoolTest(unittest.TestCase):
         ordered_2 = agy_pool.order_candidates([acc_2, acc_1], strategy="max_quota", now=now)
         self.assertEqual([x["id"] for x in ordered_2], ["second", "first"])
 
+    def test_is_show_email_enabled_and_display_account_name(self):
+        # 1. Default: disabled
+        self.assertFalse(agy_pool.is_show_email_enabled())
+        acc = {"name": "Work", "id": "acc_1", "email": "user@example.com"}
+        self.assertEqual(agy_pool.display_account_name(acc), "Work")
+
+        # 2. Explicit show_email=True
+        self.assertEqual(agy_pool.display_account_name(acc, show_email=True), "user@example.com (Work)")
+        self.assertEqual(agy_pool.display_account_name({"id": "acc_2", "email": "plain@example.com"}, show_email=True), "plain@example.com")
+        self.assertEqual(agy_pool.display_account_name({"id": "acc_3", "name": "OnlyName"}, show_email=True), "OnlyName")
+
+        # 3. Environment variable AGY_SHOW_EMAIL
+        with mock.patch.dict(os.environ, {"AGY_SHOW_EMAIL": "1"}):
+            self.assertTrue(agy_pool.is_show_email_enabled())
+            self.assertEqual(agy_pool.display_account_name(acc), "user@example.com (Work)")
+
+        # 4. Environment variable AGY_PRIVACY=0
+        with mock.patch.dict(os.environ, {"AGY_PRIVACY": "0"}):
+            self.assertTrue(agy_pool.is_show_email_enabled())
+
+        # 5. Pool config 'show_email': True
+        self.save_accounts([acc])
+        def enable_cfg(pool):
+            pool["show_email"] = True
+        agy_pool.pool_transaction(enable_cfg)
+        self.assertTrue(agy_pool.is_show_email_enabled())
+        self.assertEqual(agy_pool.display_account_name(acc), "user@example.com (Work)")
+
+    def test_manage_config_and_cli_show_email_flag(self):
+        acc = account("acc_1")
+        acc["email"] = "visible_user@example.com"
+        acc["name"] = "Personal Device"
+        self.save_accounts([acc])
+
+        # Test manage_config command
+        agy_pool.manage_config("show_email", "true")
+        pool = agy_pool.load_pool()
+        self.assertTrue(pool.get("show_email"))
+
+        agy_pool.manage_config("strategy", "round_robin")
+        pool = agy_pool.load_pool()
+        self.assertEqual(pool.get("strategy"), "round_robin")
+
+        # Test list_accounts with show_email=True flag
+        buf = io.StringIO()
+        with mock.patch("sys.stdout", buf), \
+             mock.patch.object(agy_pool, "get_daemon_pid", return_value=None), \
+             mock.patch.object(agy_pool, "_safe_quota"):
+            agy_pool.list_accounts(show_email=True)
+        out = buf.getvalue()
+        self.assertIn("visible_user@example.com (Personal Device)", out)
+
+        # Test list_accounts with show_email=False flag
+        buf2 = io.StringIO()
+        with mock.patch("sys.stdout", buf2), \
+             mock.patch.object(agy_pool, "get_daemon_pid", return_value=None), \
+             mock.patch.object(agy_pool, "_safe_quota"):
+            agy_pool.list_accounts(show_email=False)
+        out2 = buf2.getvalue()
+        self.assertIn("[1] Personal Device", out2)
+        self.assertNotIn("visible_user@example.com", out2)
+
 
 if __name__ == "__main__":
     unittest.main()

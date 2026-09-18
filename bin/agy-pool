@@ -41,7 +41,7 @@ except ImportError:
     HAS_FCNTL = False
 
 # ----------------- Constants & Configuration -----------------
-VERSION = "0.1.0-alpha9"
+VERSION = "0.1.0-beta"
 QUOTA_FRESH_MAX_AGE = 60
 QUOTA_AGING_MAX_AGE = 300
 _QUOTA_REFRESH_LOCK = threading.Lock()
@@ -355,19 +355,62 @@ def _find_account(pool, account):
                     (email and a.get("email") == email)), None)
 
 
-def display_account_name(account):
+def is_show_email_enabled(pool=None):
+    """
+    Check if real email addresses should be displayed instead of masked.
+    Evaluation order:
+      1. AGY_SHOW_EMAIL env var ('1', 'true', 'yes', 'on')
+      2. AGY_PRIVACY env var ('0', 'false', 'no', 'off')
+      3. Pool config 'show_email': True
+      4. Pool config 'privacy': False
+      5. Default: False (privacy-first masking)
+    """
+    env_show = os.environ.get("AGY_SHOW_EMAIL")
+    if env_show is not None:
+        return env_show.strip().lower() in ("1", "true", "yes", "on")
+    env_priv = os.environ.get("AGY_PRIVACY")
+    if env_priv is not None:
+        return env_priv.strip().lower() in ("0", "false", "no", "off")
+    if pool is None:
+        try:
+            pool = load_pool()
+        except Exception:
+            pool = {}
+    if isinstance(pool, dict):
+        if "show_email" in pool:
+            return bool(pool.get("show_email"))
+        if "privacy" in pool:
+            return not bool(pool.get("privacy"))
+    return False
+
+
+def display_account_name(account, show_email=None):
     """
     Returns the user-visible friendly display name for an account.
-    Never falls back to real email or values derived from email.
-    Fallback order:
-      1. Explicit friendly name / label ('name' field)
-      2. 'Account N' if account id matches 'acc_N'
-      3. 'Account' as generic safe fallback
+    When show_email is False (default):
+      Never falls back to real email or values derived from email.
+      Fallback order:
+        1. Explicit friendly name / label ('name' field)
+        2. 'Account N' if account id matches 'acc_N'
+        3. 'Account' as generic safe fallback
+    When show_email is True:
+      Formats as 'email (friendly)' if both exist, otherwise 'email',
+      falling back to friendly name or 'Account N' if email is missing.
     """
     if not isinstance(account, dict):
         return "Account"
 
+    if show_email is None:
+        show_email = is_show_email_enabled()
+
+    email = str(account.get("email") or "").strip()
     friendly = str(account.get("name") or "").strip()
+
+    if show_email and email:
+        if friendly:
+            return f"{email} ({friendly})"
+        return email
+
     if friendly:
         return friendly
 
@@ -378,6 +421,7 @@ def display_account_name(account):
             return f"Account {int(suffix)}"
 
     return "Account"
+
 
 
 TOKEN_FIELDS = ("access_token", "refresh_token", "token_expiry", "updated_at", "id_token")
@@ -1080,7 +1124,7 @@ def sync_active_agy_token_file():
 
 
 # ----------------- Quota Display & Account Management -----------------
-def list_accounts(target=None):
+def list_accounts(target=None, show_email=None):
     pool = load_pool()
     accounts = pool.get("accounts", [])
     if not accounts:
@@ -1173,7 +1217,7 @@ def list_accounts(target=None):
             marker = f"{CLR_GREEN}* Active{CLR_RESET}"
         else:
             marker = f"{CLR_CYAN}Ready{CLR_RESET}"
-        disp_name = display_account_name(acc)
+        disp_name = display_account_name(acc, show_email=show_email)
 
         print(f"{CLR_BOLD}[{i}] {disp_name}{CLR_RESET}  [{marker}]  Hits: {hits}")
 
@@ -1704,6 +1748,60 @@ def import_pool(file_path, password=None, replace=False, skip_existing=False):
         print(f"  • Active account: {CLR_CYAN}{active_id}{active_str}{CLR_RESET}")
     print(f"\nRun {CLR_BOLD}agy-pool status{CLR_RESET} to refresh quotas.\n")
     return True
+
+
+# ----------------- Configuration Management -----------------
+def manage_config(key=None, value=None):
+    pool = load_pool()
+    if key is None:
+        show_email_cfg = pool.get("show_email")
+        show_email_eff = is_show_email_enabled(pool)
+        strategy = pool.get("strategy", "max_quota")
+        env_val = os.environ.get("AGY_SHOW_EMAIL")
+        env_priv = os.environ.get("AGY_PRIVACY")
+        env_info = []
+        if env_val is not None:
+            env_info.append(f"AGY_SHOW_EMAIL={env_val}")
+        if env_priv is not None:
+            env_info.append(f"AGY_PRIVACY={env_priv}")
+        env_str = f" ({', '.join(env_info)})" if env_info else ""
+
+        print(f"\n{CLR_BOLD}=== agy-pool Configuration ==={CLR_RESET}")
+        print(f"  • {CLR_CYAN}show_email{CLR_RESET}: {show_email_eff} [Config: {show_email_cfg if show_email_cfg is not None else '<default: False>'}{env_str}]")
+        print(f"  • {CLR_CYAN}strategy{CLR_RESET}:   {strategy}")
+        print(f"\nUsage:")
+        print(f"  agy-pool config show_email <true|false|on|off>")
+        print(f"  agy-pool config strategy <max_quota|round_robin|least_used>\n")
+        return
+
+    k = key.strip().lower().replace("-", "_")
+    if k in ("show_email", "email"):
+        if value is None:
+            print(f"show_email: {is_show_email_enabled(pool)}")
+            return
+        b_val = value.strip().lower() in ("1", "true", "yes", "on", "enable")
+        def update(p):
+            p["show_email"] = b_val
+            p.pop("privacy", None)
+        pool_transaction(update)
+        status_str = "ENABLED (real emails displayed)" if b_val else "DISABLED (privacy masking active)"
+        print(f"{CLR_GREEN}✓ Configuration updated: show_email = {b_val} ({status_str}){CLR_RESET}")
+    elif k == "strategy":
+        if value is None:
+            print(f"strategy: {pool.get('strategy', 'max_quota')}")
+            return
+        val = value.strip().lower()
+        if val not in ("max_quota", "round_robin", "least_used"):
+            print(f"{CLR_RED}[Error] Invalid strategy '{value}'. Allowed: max_quota, round_robin, least_used{CLR_RESET}")
+            sys.exit(1)
+        def update(p):
+            p["strategy"] = val
+        pool_transaction(update)
+        print(f"{CLR_GREEN}✓ Configuration updated: strategy = {val}{CLR_RESET}")
+    else:
+        print(f"{CLR_RED}[Error] Unknown configuration key: {key}{CLR_RESET}")
+        print("Supported keys: show_email, strategy")
+        sys.exit(1)
 
 
 # ----------------- Log Management & Rotation -----------------
@@ -3032,6 +3130,8 @@ def main():
     # list / quota / status
     list_p = subparsers.add_parser("list", aliases=["ls", "quota"], help="List accounts and display quota dashboard")
     list_p.add_argument("target", nargs="?", default=None, help="Optional account index, name, or email")
+    list_p.add_argument("--show-email", dest="show_email", action="store_true", default=None, help="Display real email addresses instead of masking")
+    list_p.add_argument("--hide-email", dest="show_email", action="store_false", help="Hide real email addresses (mask with friendly names/aliases)")
     # remove
     rm_p = subparsers.add_parser("remove", aliases=["rm"], help="Remove an account by index, name, or email")
     rm_p.add_argument("target", help="Account index, name, or email")
@@ -3063,7 +3163,13 @@ def main():
     subparsers.add_parser("start", help="Start background load balancer proxy daemon")
     subparsers.add_parser("stop", help="Stop background load balancer proxy daemon")
     subparsers.add_parser("restart", help="Restart background load balancer proxy daemon")
-    subparsers.add_parser("status", help="Check status of proxy daemon and pool")
+    stat_p = subparsers.add_parser("status", help="Check status of proxy daemon and pool")
+    stat_p.add_argument("--show-email", dest="show_email", action="store_true", default=None, help="Display real email addresses instead of masking")
+    stat_p.add_argument("--hide-email", dest="show_email", action="store_false", help="Hide real email addresses (mask with friendly names/aliases)")
+    # config
+    cfg_p = subparsers.add_parser("config", help="View or update pool configuration settings (e.g. show_email, strategy)")
+    cfg_p.add_argument("key", nargs="?", default=None, help="Configuration key (show_email, strategy)")
+    cfg_p.add_argument("value", nargs="?", default=None, help="Value to set (e.g. true/false)")
     subparsers.add_parser("version", help="Show version information")
     subparsers.add_parser("daemon-run", help=argparse.SUPPRESS)  # Internal daemon worker
     # run wrapper
@@ -3082,7 +3188,7 @@ def main():
     elif cmd == "import-current":
         import_current()
     elif cmd in ["list", "ls", "quota"]:
-        list_accounts(getattr(args, "target", None))
+        list_accounts(getattr(args, "target", None), show_email=getattr(args, "show_email", None))
     elif cmd in ["remove", "rm"]:
         remove_account(args.target)
     elif cmd == "switch":
@@ -3113,7 +3219,9 @@ def main():
                 print(f"{CLR_GREEN}✓ Gateway Proxy is RUNNING (PID: {info['pid']}{ver_note}) on http://127.0.0.1:{DEFAULT_PORT}{CLR_RESET}")
         else:
             print(f"{CLR_YELLOW}○ Gateway Proxy is STOPPED{CLR_RESET}")
-        list_accounts()
+        list_accounts(show_email=getattr(args, "show_email", None))
+    elif cmd == "config":
+        manage_config(args.key, args.value)
     elif cmd == "version":
         print(f"agy-pool {VERSION}")
     elif cmd == "daemon-run":

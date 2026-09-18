@@ -5,6 +5,30 @@ All notable changes to the `agy-pool` project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.0-beta] - 2026-09-19
+
+### Added
+- **Official Promotion to Beta Release Stage**:
+  - Successfully graduated `agy-pool` from experimental alpha iterations into official beta status with hardened scheduling, failover correctness, and test sandboxing.
+- **Atomic Concurrency & Round-Robin Scheduling**:
+  - Atomically reserves candidate accounts and advances the round-robin cursor prior to network I/O, preventing completion-order races under concurrent CLI sessions.
+  - Multi-window capacity scheduling balancing both 5-hour and weekly quotas relative to time remaining before reset.
+  - Quota snapshot freshness classification (fresh, aging, stale, unknown) with asynchronous single-flight refresh and bounded exponential backoff.
+- **Provably Uncommitted Transport Failover & Anti-Replay Protection**:
+  - Transparently fails over for provably uncommitted network errors (DNS resolution failure, connection refusal `ECONNREFUSED`, network unreachable, and early TLS setup failures).
+  - Enforces strict no-replay semantics on ambiguous transport timeouts and mid-stream disconnects, returning 504/502 to eliminate duplicate token generation and accidental double quota consumption.
+- **Account Privacy Masking & Configurable Visibility**:
+  - Automatically masks raw Google account email addresses in terminal status dashboards and proxy logs behind user-configured friendly names or anonymous fallback aliases (`Account 1`, `Account 2`).
+  - Added multi-tier privacy visibility controls: `agy-pool config show_email <true|false>`, `AGY_SHOW_EMAIL` environment variable, and `--show-email` / `--hide-email` CLI arguments on `status` and `quota`.
+- **Persistent State Isolation & Test Sandbox Safety**:
+  - Added fail-closed runtime protection (`_assert_safe_write_path`) ensuring unit tests never accidentally write to or delete production `~/.gemini` or host installation paths.
+  - Decoupled hardcoded paths with configurable runtime state roots via `configure_paths()` and `AGY_GEMINI_DIR`.
+  - Expanded automated test coverage to 84 tests covering installer lifecycle, upgrade idempotency, and state preservation.
+
+### Changed
+- **Documentation Streamlining**:
+  - Polished and streamlined `README.md` into a concise, high-signal overview highlighting essential workflows and commands.
+
 ## [0.1.0-alpha9] - 2026-09-16
 
 ### Fixed
