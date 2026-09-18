@@ -1,9 +1,11 @@
 import base64
 import contextlib
 import email.message
+import errno
 import http.client
 import http.server
 import importlib.machinery
+import ssl
 import importlib.util
 import io
 import json
@@ -16,6 +18,8 @@ import tempfile
 import threading
 import time
 import unittest
+import urllib.error
+import urllib.parse
 from unittest import mock
 
 
@@ -117,6 +121,11 @@ class AgyPoolTest(unittest.TestCase):
         self.addCleanup(_restore_state)
 
         agy_pool.FILE_LOCKS.clear()
+        agy_pool._QUOTA_REFRESH_IN_FLIGHT.clear()
+        agy_pool._QUOTA_REFRESH_RETRY.clear()
+        self.refresh_patch = mock.patch.object(agy_pool, "schedule_quota_refresh")
+        self.refresh_mock = self.refresh_patch.start()
+        self.addCleanup(self.refresh_patch.stop)
 
     def save_accounts(self, accounts, active="a"):
         agy_pool.save_pool({
@@ -151,6 +160,135 @@ class AgyPoolTest(unittest.TestCase):
         result = (response.status, data, dict(response.getheaders()))
         conn.close()
         return result
+
+    def test_fresh_snapshot_needs_no_refresh_and_aging_needs_one(self):
+        now = 1_000_000.0
+        fresh = {"last_quota": {"updated_at": now - 30}}
+        aging = {"last_quota": {"updated_at": now - 120}}
+        self.assertFalse(agy_pool.quota_refresh_needed(fresh, now))
+        self.assertTrue(agy_pool.quota_refresh_needed(aging, now))
+        agy_pool.schedule_quota_refresh(aging)
+        self.refresh_mock.assert_called_once_with(aging)
+
+    def test_quota_freshness_classes_and_reset_expiry(self):
+        now = 1_000_000.0
+        def snapshot(updated, reset=None):
+            return {"last_quota": {"updated_at": updated, "gemini_5h": {"fraction": 0.7, "reset_time": reset}}}
+        self.assertEqual(agy_pool.quota_freshness(snapshot(now - 30), now)["class"], "fresh")
+        self.assertEqual(agy_pool.quota_freshness(snapshot(now - 120), now)["class"], "aging")
+        self.assertEqual(agy_pool.quota_freshness(snapshot(now - 600), now)["class"], "stale")
+        self.assertEqual(agy_pool.quota_freshness({"last_quota": {}}, now)["class"], "unknown")
+        self.assertEqual(agy_pool.quota_freshness(snapshot(now - 1, now - 1), now)["class"], "stale")
+
+    def test_refresh_failure_uses_bounded_backoff_and_success_resets(self):
+        self.refresh_patch.stop()
+        acc = account("retry")
+        acc["last_quota"] = {"updated_at": 1, "gemini_5h": {"fraction": 0.7}}
+        calls = []
+        def fail(_):
+            calls.append(1)
+        with mock.patch.object(agy_pool, "_safe_quota", side_effect=fail):
+            self.assertTrue(agy_pool.schedule_quota_refresh(acc, now=1000))
+            for _ in range(20):
+                if not agy_pool._QUOTA_REFRESH_IN_FLIGHT:
+                    break
+                time.sleep(0.01)
+            self.assertFalse(agy_pool.schedule_quota_refresh(acc, now=1001))
+            retry = agy_pool._QUOTA_REFRESH_RETRY["retry"]
+            self.assertGreaterEqual(retry["next_at"], time.time() + 29)
+            self.assertLessEqual(retry["next_at"], time.time() + 31)
+            self.assertEqual(len(calls), 1)
+        # Exhaust the sequence deterministically without sleeping.
+        for expected in (60, 120, 240, 300, 300):
+            retry["next_at"] = 0
+            with mock.patch.object(agy_pool, "_safe_quota", return_value=False):
+                self.assertTrue(agy_pool.schedule_quota_refresh(acc, now=2000))
+            for _ in range(20):
+                if not agy_pool._QUOTA_REFRESH_IN_FLIGHT:
+                    break
+                time.sleep(0.01)
+            retry = agy_pool._QUOTA_REFRESH_RETRY["retry"]
+            self.assertLessEqual(abs((retry["next_at"] - time.time()) - expected), 1)
+        retry["next_at"] = 0
+        with mock.patch.object(agy_pool, "_safe_quota", return_value=True):
+            self.assertTrue(agy_pool.schedule_quota_refresh(acc, now=3000))
+        for _ in range(20):
+            if not agy_pool._QUOTA_REFRESH_IN_FLIGHT:
+                break
+            time.sleep(0.01)
+        self.assertNotIn("retry", agy_pool._QUOTA_REFRESH_RETRY)
+
+    def test_fresh_and_aging_capacity_order_by_capacity(self):
+        now = time.time()
+        low = account("low")
+        low["last_quota"] = {"updated_at": now - 30, "gemini_5h": {"fraction": 0.20}, "gemini_weekly": {"fraction": 0.20}}
+        high = account("high")
+        high["last_quota"] = {"updated_at": now - 61, "gemini_5h": {"fraction": 0.90}, "gemini_weekly": {"fraction": 0.90}}
+        ordered = agy_pool.order_candidates([low, high], now=now)
+        self.assertEqual(ordered[0]["id"], "high")
+
+    def test_fresh_and_aging_equal_capacity_use_existing_ties(self):
+        now = time.time()
+        accounts = []
+        for account_id, age in (("first", 30), ("second", 61)):
+            acc = account(account_id)
+            acc["last_quota"] = {"updated_at": now - age, "gemini_5h": {"fraction": 0.8}, "gemini_weekly": {"fraction": 0.8}}
+            accounts.append(acc)
+        self.assertEqual(agy_pool.order_candidates(accounts, now=now)[0]["id"], "first")
+
+    def test_stale_is_below_fresh_and_unknown_is_lowest_freshness(self):
+        now = time.time()
+        def make(account_id, updated):
+            acc = account(account_id)
+            acc["last_quota"] = {"updated_at": updated, "gemini_5h": {"fraction": 0.8}, "gemini_weekly": {"fraction": 0.8}}
+            return acc
+        fresh = make("fresh", now - 30)
+        stale = make("stale", now - 600)
+        unknown = make("unknown", None)
+        unknown["last_quota"].pop("updated_at")
+        ordered = agy_pool.order_candidates([unknown, stale, fresh], now=now)
+        self.assertEqual([a["id"] for a in ordered], ["fresh", "stale", "unknown"])
+
+    def test_stale_refresh_is_single_flight(self):
+        self.refresh_patch.stop()
+        acc = account("single")
+        acc["last_quota"] = {"updated_at": 1, "gemini_5h": {"fraction": 0.7}}
+        started = threading.Event()
+        release = threading.Event()
+        calls = []
+        def refresh(_):
+            calls.append(1)
+            started.set()
+            release.wait(2)
+        with mock.patch.object(agy_pool, "_safe_quota", side_effect=refresh):
+            self.assertTrue(agy_pool.schedule_quota_refresh(acc))
+            self.assertFalse(agy_pool.schedule_quota_refresh(acc))
+            self.assertTrue(started.wait(1))
+            release.set()
+        for _ in range(20):
+            if not agy_pool._QUOTA_REFRESH_IN_FLIGHT:
+                break
+            time.sleep(0.01)
+        self.assertEqual(len(calls), 1)
+
+    def test_safe_quota_success_persists_fresh_timestamp(self):
+        acc = account("freshened")
+        old = {"updated_at": 1, "gemini_5h": {"fraction": 0.4}}
+        acc["last_quota"] = old
+        self.save_accounts([acc])
+        new = {"updated_at": int(time.time()), "gemini_5h": {"fraction": 0.8}}
+        with mock.patch.object(agy_pool, "query_quota", side_effect=lambda a: a.update(last_quota=new) or new):
+            self.assertTrue(agy_pool._safe_quota(dict(acc)))
+        self.assertEqual(agy_pool.load_pool()["accounts"][0]["last_quota"], new)
+
+    def test_safe_quota_failure_preserves_snapshot(self):
+        acc = account("not-freshened")
+        old = {"updated_at": 1, "gemini_5h": {"fraction": 0.4}}
+        acc["last_quota"] = old
+        self.save_accounts([acc])
+        with mock.patch.object(agy_pool, "query_quota", side_effect=OSError("offline")):
+            self.assertFalse(agy_pool._safe_quota(dict(acc)))
+        self.assertEqual(agy_pool.load_pool()["accounts"][0]["last_quota"], old)
 
     def test_threaded_request_count_transaction_has_no_lost_updates(self):
         self.save_accounts([account("a")])
@@ -436,9 +574,9 @@ class AgyPoolTest(unittest.TestCase):
             handler.close_connection = True
 
         proxy = self.start_proxy(Scenario({"token-a": [malformed]}))
-        self.assertEqual(self.request(proxy)[0], 503)
+        self.assertEqual(self.request(proxy)[0], 502)
 
-    def test_upstream_timeout_fails_over_to_next_account(self):
+    def test_upstream_timeout_returns_504_without_replay(self):
         self.save_accounts([account("a"), account("b")])
         proxy = self.start_server(agy_pool.SmartProxyHandler)
         calls = []
@@ -448,8 +586,8 @@ class AgyPoolTest(unittest.TestCase):
             raise socket.timeout("timed out")
 
         with mock.patch.object(agy_pool.urllib.request, "urlopen", timeout):
-            self.assertEqual(self.request(proxy)[0], 503)
-        self.assertEqual(len(calls), 2)
+            self.assertEqual(self.request(proxy)[0], 504)
+        self.assertEqual(len(calls), 1)
 
     def test_malformed_client_chunking_is_rejected(self):
         self.save_accounts([account("a")])
@@ -1214,7 +1352,958 @@ class AgyPoolTest(unittest.TestCase):
         with open(pool_file, "r", encoding="utf-8") as f:
             self.assertEqual(json.load(f)["accounts"][0]["id"], "acc_keep")
 
+    def test_display_account_name_resolution(self):
+        # 1. Explicit friendly name
+        self.assertEqual(agy_pool.display_account_name({"name": "Work", "id": "acc_1", "email": "user@secret.com"}), "Work")
+        self.assertEqual(agy_pool.display_account_name({"name": "  Project Lead  ", "id": "acc_2"}), "Project Lead")
+        # 2. Safe fallback for acc_N
+        self.assertEqual(agy_pool.display_account_name({"name": None, "id": "acc_1", "email": "user@secret.com"}), "Account 1")
+        self.assertEqual(agy_pool.display_account_name({"name": "", "id": "acc_42", "email": "user@secret.com"}), "Account 42")
+        # 3. Generic safe fallback
+        self.assertEqual(agy_pool.display_account_name({"name": None, "id": "custom_uuid", "email": "user@secret.com"}), "Account")
+        self.assertEqual(agy_pool.display_account_name({}), "Account")
+        self.assertEqual(agy_pool.display_account_name(None), "Account")
+        self.assertEqual(agy_pool.display_account_name("invalid"), "Account")
+
+    def test_list_accounts_privacy_and_target_filtering(self):
+        acc1 = account("acc_1")
+        acc1["email"] = "supersecret_alpha@example.org"
+        acc1["name"] = "Production Cloud"
+        acc1["gen_count"] = 12
+
+        acc2 = account("acc_2")
+        acc2["email"] = "confidential_beta@enterprise.com"
+        acc2["name"] = None
+        acc2["gen_count"] = 7
+
+        self.save_accounts([acc1, acc2], active="acc_1")
+
+        # Full listing
+        buf = io.StringIO()
+        with mock.patch("sys.stdout", buf), \
+             mock.patch.object(agy_pool, "get_daemon_pid", return_value=None), \
+             mock.patch.object(agy_pool, "_safe_quota"):
+            agy_pool.list_accounts()
+        output = buf.getvalue()
+
+        self.assertIn("[1] Production Cloud", output)
+        self.assertIn("[2] Account 2", output)
+        self.assertNotIn("supersecret_alpha@example.org", output)
+        self.assertNotIn("supersecret_alpha", output)
+        self.assertNotIn("confidential_beta@enterprise.com", output)
+        self.assertNotIn("confidential_beta", output)
+
+        # Filtered by target index
+        buf_idx = io.StringIO()
+        with mock.patch("sys.stdout", buf_idx), \
+             mock.patch.object(agy_pool, "get_daemon_pid", return_value=None), \
+             mock.patch.object(agy_pool, "_safe_quota"):
+            agy_pool.list_accounts("1")
+        out_idx = buf_idx.getvalue()
+        self.assertIn("[1] Production Cloud", out_idx)
+        self.assertNotIn("Account 2", out_idx)
+        self.assertNotIn("supersecret_alpha", out_idx)
+
+        # Filtered by email target input (matching succeeds, but email is NEVER echoed in output)
+        buf_email = io.StringIO()
+        with mock.patch("sys.stdout", buf_email), \
+             mock.patch.object(agy_pool, "get_daemon_pid", return_value=None), \
+             mock.patch.object(agy_pool, "_safe_quota"):
+            agy_pool.list_accounts("confidential_beta@enterprise.com")
+        out_email = buf_email.getvalue()
+        self.assertIn("Account 2", out_email)
+        self.assertNotIn("Production Cloud", out_email)
+        self.assertNotIn("confidential_beta@enterprise.com", out_email)
+        self.assertNotIn("confidential_beta", out_email)
+
+        # Filtered by friendly name target input
+        buf_name = io.StringIO()
+        with mock.patch("sys.stdout", buf_name), \
+             mock.patch.object(agy_pool, "get_daemon_pid", return_value=None), \
+             mock.patch.object(agy_pool, "_safe_quota"):
+            agy_pool.list_accounts("Production Cloud")
+        out_name = buf_name.getvalue()
+        self.assertIn("[1] Production Cloud", out_name)
+        self.assertNotIn("Account 2", out_name)
+        self.assertNotIn("supersecret_alpha", out_name)
+
+    def test_account_management_privacy_with_real_email_targets(self):
+        acc1 = account("acc_1")
+        acc1["email"] = "alice_dev@corp.internal"
+        acc1["name"] = None
+
+        acc2 = account("acc_2")
+        acc2["email"] = "bob_ops@corp.internal"
+        acc2["name"] = "Operations Lead"
+
+        self.save_accounts([acc1, acc2], active="acc_1")
+
+        # switch using real email target
+        buf_sw = io.StringIO()
+        with mock.patch("sys.stdout", buf_sw), mock.patch.object(agy_pool, "_safe_quota"):
+            agy_pool.switch_account("bob_ops@corp.internal")
+        out_sw = buf_sw.getvalue()
+        self.assertIn("Operations Lead", out_sw)
+        self.assertNotIn("bob_ops@corp.internal", out_sw)
+        self.assertNotIn("bob_ops", out_sw)
+        self.assertEqual(agy_pool.load_pool()["active_account_id"], "acc_2")
+
+        # switch using friendly name
+        buf_sw_name = io.StringIO()
+        with mock.patch("sys.stdout", buf_sw_name), mock.patch.object(agy_pool, "_safe_quota"):
+            agy_pool.switch_account("Operations Lead")
+        out_sw_name = buf_sw_name.getvalue()
+        self.assertIn("Operations Lead", out_sw_name)
+        self.assertNotIn("bob_ops", out_sw_name)
+
+        # remove using real email target
+        buf_rm = io.StringIO()
+        with mock.patch("sys.stdout", buf_rm):
+            agy_pool.remove_account("alice_dev@corp.internal")
+        out_rm = buf_rm.getvalue()
+        self.assertIn("Account 1", out_rm)
+        self.assertNotIn("alice_dev@corp.internal", out_rm)
+        self.assertNotIn("alice_dev", out_rm)
+        pool = agy_pool.load_pool()
+        self.assertEqual(len(pool["accounts"]), 1)
+        self.assertEqual(pool["accounts"][0]["name"], "Operations Lead")
+
+        # remove using friendly name
+        buf_rm_name = io.StringIO()
+        with mock.patch("sys.stdout", buf_rm_name):
+            agy_pool.remove_account("Operations Lead")
+        out_rm_name = buf_rm_name.getvalue()
+        self.assertIn("Operations Lead", out_rm_name)
+        self.assertNotIn("bob_ops", out_rm_name)
+        self.assertEqual(len(agy_pool.load_pool()["accounts"]), 0)
+
+    def test_uncommitted_transport_error_predicates(self):
+        # Provably uncommitted failures
+        self.assertTrue(agy_pool._is_uncommitted_transport_error(
+            urllib.error.URLError(ConnectionRefusedError(111, "Connection refused"))))
+        self.assertTrue(agy_pool._is_uncommitted_transport_error(
+            urllib.error.URLError(socket.gaierror(-2, "Name or service not known"))))
+        self.assertTrue(agy_pool._is_uncommitted_transport_error(
+            urllib.error.URLError(ssl.SSLError("TLS handshake failed"))))
+        self.assertTrue(agy_pool._is_uncommitted_transport_error(
+            urllib.error.URLError(OSError(errno.ENETUNREACH, "Network is unreachable"))))
+        self.assertTrue(agy_pool._is_uncommitted_transport_error(
+            urllib.error.URLError(OSError(errno.EHOSTUNREACH, "No route to host"))))
+        self.assertTrue(agy_pool._is_uncommitted_transport_error(
+            ConnectionRefusedError(111, "Connection refused")))
+        self.assertTrue(agy_pool._is_uncommitted_transport_error(
+            socket.gaierror(-2, "Name or service not known")))
+        self.assertTrue(agy_pool._is_uncommitted_transport_error(
+            ssl.SSLError("TLS handshake failed")))
+
+        # Ambiguous failures (must NOT qualify as uncommitted)
+        self.assertFalse(agy_pool._is_uncommitted_transport_error(
+            socket.timeout("timed out")))
+        self.assertFalse(agy_pool._is_uncommitted_transport_error(
+            TimeoutError("timed out")))
+        self.assertFalse(agy_pool._is_uncommitted_transport_error(
+            urllib.error.URLError(socket.timeout("timed out"))))
+        self.assertFalse(agy_pool._is_uncommitted_transport_error(
+            http.client.RemoteDisconnected("Remote end closed connection without response")))
+        self.assertFalse(agy_pool._is_uncommitted_transport_error(
+            ConnectionResetError("Connection reset by peer")))
+        self.assertFalse(agy_pool._is_uncommitted_transport_error(
+            http.client.IncompleteRead(b"", 100)))
+        self.assertFalse(agy_pool._is_uncommitted_transport_error(
+            http.client.BadStatusLine("???")))
+        self.assertFalse(agy_pool._is_uncommitted_transport_error(
+            urllib.error.HTTPError("http://example.test", 403, "Forbidden", {}, None)))
+
+    def test_uncommitted_transport_failure_fails_over_transparently(self):
+        """
+        When candidate A encounters a provably uncommitted transport failure,
+        the proxy transparently fails over to candidate B and succeeds.
+        """
+        self.save_accounts([account("a"), account("b")])
+        proxy = self.start_server(agy_pool.SmartProxyHandler)
+        calls = []
+
+        class DummyResponse:
+            status = 200
+            def __init__(self, body=b'{"result": "success_b"}'):
+                self.headers = email.message.Message()
+                self.headers["Content-Type"] = "application/json"
+                self._body = io.BytesIO(body)
+            def __enter__(self):
+                return self
+            def __exit__(self, *args):
+                pass
+            def read(self, size=-1):
+                return self._body.read(size)
+            def read1(self, size=-1):
+                return self._body.read(size)
+
+        def urlopen_mock(req, *args, **kwargs):
+            auth = req.get_header("Authorization")
+            calls.append(auth)
+            if "token-a" in auth:
+                raise urllib.error.URLError(ConnectionRefusedError(111, "Connection refused"))
+            return DummyResponse()
+
+        with mock.patch.object(agy_pool.urllib.request, "urlopen", urlopen_mock):
+            status, body, _ = self.request(proxy, "/v1internal:generateContent")
+
+        self.assertEqual(status, 200)
+        self.assertIn(b"success_b", body)
+        self.assertEqual(calls, ["Bearer token-a", "Bearer token-b"])
+
+        # Account A recorded transport error but was NOT locked out as auth error
+        pool = agy_pool.load_pool()
+        acc_a = next(a for a in pool["accounts"] if a["id"] == "a")
+        acc_b = next(a for a in pool["accounts"] if a["id"] == "b")
+        self.assertEqual(acc_a.get("error_count"), 1)
+        self.assertIsNone(acc_a.get("status"))
+        self.assertIsNone(acc_a.get("rate_limited_until"))
+        self.assertEqual(acc_b.get("gen_count"), 1)
+
+    def test_all_accounts_uncommitted_transport_failure_returns_503(self):
+        """
+        When all candidate accounts fail with uncommitted transport failures,
+        the proxy returns 503 indicating all accounts exhausted/unavailable.
+        """
+        self.save_accounts([account("a"), account("b")])
+        proxy = self.start_server(agy_pool.SmartProxyHandler)
+        calls = []
+
+        def urlopen_mock(req, *args, **kwargs):
+            calls.append(req.get_header("Authorization"))
+            raise urllib.error.URLError(socket.gaierror(-2, "Name or service not known"))
+
+        with mock.patch.object(agy_pool.urllib.request, "urlopen", urlopen_mock):
+            status, body, _ = self.request(proxy, "/v1internal:generateContent")
+
+        self.assertEqual(status, 503)
+        self.assertIn(b"All accounts in pool exhausted or unavailable", body)
+        self.assertEqual(len(calls), 2)
+
+    def test_ambiguous_generation_failure_preserves_no_replay_remote_disconnected(self):
+        """
+        When a generation request fails with RemoteDisconnected (upstream closed after sending),
+        the failure is ambiguous: proxy must NOT replay to candidate B, preserving no-replay semantics.
+        """
+        self.save_accounts([account("a"), account("b")])
+        proxy = self.start_server(agy_pool.SmartProxyHandler)
+        calls = []
+
+        def urlopen_mock(req, *args, **kwargs):
+            calls.append(req.get_header("Authorization"))
+            raise http.client.RemoteDisconnected("Remote end closed connection without response")
+
+        with mock.patch.object(agy_pool.urllib.request, "urlopen", urlopen_mock):
+            status, _, _ = self.request(proxy, "/v1internal:streamGenerateContent")
+
+        self.assertEqual(status, 502)
+        # Only account A was called; account B was never called
+        self.assertEqual(calls, ["Bearer token-a"])
+
+    def test_uncommitted_token_refresh_error_does_not_set_auth_error_status(self):
+        """
+        When token refresh fails with an uncommitted transport error (e.g. DNS failure),
+        the account is NOT marked with status='auth_error' and proxy fails over to next account.
+        """
+        self.save_accounts([account("a"), account("b")])
+        proxy = self.start_server(agy_pool.SmartProxyHandler)
+
+        def refresh_mock(acc):
+            if acc["id"] == "a":
+                raise urllib.error.URLError(ConnectionRefusedError(111, "Connection refused"))
+            return "token-b"
+
+        class DummyResponse:
+            status = 200
+            def __init__(self, body=b'{"ok": true}'):
+                self.headers = email.message.Message()
+                self.headers["Content-Type"] = "application/json"
+                self._body = io.BytesIO(body)
+            def __enter__(self):
+                return self
+            def __exit__(self, *args):
+                pass
+            def read(self, size=-1):
+                return self._body.read(size)
+            def read1(self, size=-1):
+                return self._body.read(size)
+
+        with mock.patch.object(agy_pool, "refresh_token", refresh_mock), \
+             mock.patch.object(agy_pool.urllib.request, "urlopen", side_effect=lambda *args, **kwargs: DummyResponse()):
+            status, body, _ = self.request(proxy, "/v1internal:generateContent")
+
+        self.assertEqual(status, 200)
+        self.assertIn(b"ok", body)
+
+        pool = agy_pool.load_pool()
+        acc_a = next(a for a in pool["accounts"] if a["id"] == "a")
+        self.assertNotEqual(acc_a.get("status"), "auth_error")
+        self.assertIsNone(acc_a.get("rate_limited_until"))
+
+    def test_strategy_least_used_and_round_robin_selection(self):
+        acc1 = account("a")
+        acc1["gen_count"] = 10
+        acc1["last_used_at"] = 1000
+        acc1["last_quota"] = {"remaining_fraction": 1.0}
+
+        acc2 = account("b")
+        acc2["gen_count"] = 2
+        acc2["last_used_at"] = 2000
+        acc2["last_quota"] = {"remaining_fraction": 0.5}
+
+        # 1. least_used strategy: b has gen_count=2, a has 10 -> b selected first despite lower quota
+        self.save_accounts([acc1, acc2])
+        agy_pool.pool_transaction(lambda p: p.update(strategy="least_used"))
+        scenario = Scenario({"token-b": [(200, b"ok-b", {})]})
+        proxy = self.start_proxy(scenario)
+        status, body, _ = self.request(proxy, "/v1internal:streamGenerateContent")
+        self.assertEqual((status, body), (200, b"ok-b"))
+        self.assertEqual(scenario.calls[0][0], "token-b")
+
+        # 2. round_robin strategy: cursor starts at None, a selected first
+        self.save_accounts([acc1, acc2])
+        agy_pool.pool_transaction(lambda p: p.update(strategy="round_robin"))
+        scenario2 = Scenario({"token-a": [(200, b"ok-a", {})]})
+        proxy2 = self.start_proxy(scenario2)
+        status, body, _ = self.request(proxy2, "/v1internal:streamGenerateContent")
+        self.assertEqual((status, body), (200, b"ok-a"))
+        self.assertEqual(scenario2.calls[0][0], "token-a")
+
+    def test_round_robin_rotation_and_cursor_advancement(self):
+        acc1 = account("a")
+        acc2 = account("b")
+        acc3 = account("c")
+        self.save_accounts([acc1, acc2, acc3])
+        agy_pool.pool_transaction(lambda p: p.update(strategy="round_robin"))
+
+        # Candidate order does not advance cursor
+        pool = agy_pool.load_pool()
+        ordered = agy_pool.order_candidates(pool["accounts"], strategy="round_robin", pool=pool)
+        self.assertEqual([a["id"] for a in ordered], ["a", "b", "c"])
+        self.assertIsNone(agy_pool.load_pool().get("round_robin_last_account_id"))
+
+        # Request 1 dispatches to A
+        scenario = Scenario({
+            "token-a": [(200, b"res-a", {}), (200, b"res-a", {}), (200, b"res-a", {})],
+            "token-b": [(200, b"res-b", {})],
+            "token-c": [(200, b"res-c", {}), (200, b"res-c", {})],
+            "token-d": [(200, b"res-d", {})],
+        })
+        proxy = self.start_proxy(scenario)
+        st, body, _ = self.request(proxy, "/v1internal:streamGenerateContent")
+        self.assertEqual(body, b"res-a")
+        self.assertEqual(agy_pool.load_pool().get("round_robin_last_account_id"), "a")
+
+        # Request 2 dispatches to B
+        st, body, _ = self.request(proxy, "/v1internal:streamGenerateContent")
+        self.assertEqual(body, b"res-b")
+        self.assertEqual(agy_pool.load_pool().get("round_robin_last_account_id"), "b")
+
+        # Request 3 dispatches to C
+        st, body, _ = self.request(proxy, "/v1internal:streamGenerateContent")
+        self.assertEqual(body, b"res-c")
+        self.assertEqual(agy_pool.load_pool().get("round_robin_last_account_id"), "c")
+
+        # Request 4 wraps around to A
+        st, body, _ = self.request(proxy, "/v1internal:streamGenerateContent")
+        self.assertEqual(body, b"res-a")
+        self.assertEqual(agy_pool.load_pool().get("round_robin_last_account_id"), "a")
+
+        # Put account B in cooldown; next request should skip B and dispatch to C
+        agy_pool.pool_transaction(lambda p: [a.update(rate_limited_until=time.time() + 300) for a in p["accounts"] if a["id"] == "b"])
+        st, body, _ = self.request(proxy, "/v1internal:streamGenerateContent")
+        self.assertEqual(body, b"res-c")
+        self.assertEqual(agy_pool.load_pool().get("round_robin_last_account_id"), "c")
+
+        # Delete account C; cursor was on C; fallback cleanly picks next available (A)
+        agy_pool.pool_transaction(lambda p: p.update(accounts=[a for a in p["accounts"] if a["id"] != "c"]))
+        st, body, _ = self.request(proxy, "/v1internal:streamGenerateContent")
+        self.assertEqual(body, b"res-a")
+
+        # Add account D; it joins rotation
+        acc4 = account("d")
+        agy_pool.pool_transaction(lambda p: p["accounts"].append(acc4))
+        st, body, _ = self.request(proxy, "/v1internal:streamGenerateContent")
+        self.assertEqual(body, b"res-d")
+        self.assertEqual(agy_pool.load_pool().get("round_robin_last_account_id"), "d")
+
+    def test_strategy_legacy_pool_and_tie_breaking(self):
+        # Legacy pool missing "strategy" field
+        self.save_accounts([account("a")])
+        agy_pool.pool_transaction(lambda p: p.pop("strategy", None))
+        pool = agy_pool.load_pool()
+        self.assertNotIn("strategy", pool)
+
+        # Default query returns max_quota
+        self.assertEqual(pool.get("strategy", "max_quota"), "max_quota")
+
+        # order_candidates defaults to max_quota
+        acc1 = account("a")
+        acc1["last_quota"] = {"remaining_fraction": 0.5}
+        acc2 = account("b")
+        acc2["last_quota"] = {"remaining_fraction": 0.9}
+        ordered = agy_pool.order_candidates([acc1, acc2], pool=pool)
+        self.assertEqual([x["id"] for x in ordered], ["b", "a"])
+
+        # least_used tie-breaking: equal hits -> highest quota first -> stable ID
+        acc1 = account("a")
+        acc1["gen_count"] = 5
+        acc1["last_quota"] = {"remaining_fraction": 0.50}
+        acc2 = account("b")
+        acc2["gen_count"] = 5
+        acc2["last_quota"] = {"remaining_fraction": 0.80}
+        acc3 = account("c")
+        acc3["gen_count"] = 5
+        acc3["last_quota"] = {"remaining_fraction": 0.80}
+
+        ordered_lu = agy_pool.order_candidates([acc1, acc2, acc3], strategy="least_used")
+        # acc2 and acc3 have higher quota (0.80) than acc1 (0.50). Between acc2 and acc3, 'b' < 'c'
+        self.assertEqual([x["id"] for x in ordered_lu], ["b", "c", "a"])
+
+    def test_max_quota_fallback_preserves_raw_order(self):
+        now = time.time()
+        cd1 = account("cd_later")
+        cd1["rate_limited_until"] = now + 500
+        cd2 = account("cd_sooner")
+        cd2["rate_limited_until"] = now + 10
+
+        res1 = account("z_restricted")
+        res1["status"] = "validation_required"
+        res2 = account("a_restricted")
+        res2["status"] = "auth_error"
+
+        # Under max_quota, fallback ordering must preserve exact input order (pre-alpha9 stable sort)
+        ordered = agy_pool.order_candidates([cd1, cd2, res1, res2], strategy="max_quota", now=now)
+        self.assertEqual([a["id"] for a in ordered], ["cd_later", "cd_sooner", "z_restricted", "a_restricted"])
+
+    def test_round_robin_concurrent_selection_prevents_duplicate_account(self):
+        acc1 = account("a")
+        acc2 = account("b")
+        acc3 = account("c")
+        self.save_accounts([acc1, acc2, acc3])
+        agy_pool.pool_transaction(lambda p: p.update(strategy="round_robin", round_robin_last_account_id="a"))
+
+        # Upstream coordination: hold both upstream handlers until both have arrived
+        barrier = threading.Barrier(2)
+        received_tokens = []
+        tokens_lock = threading.Lock()
+
+        def make_upstream_handler(token_name):
+            def handler(req_handler):
+                with tokens_lock:
+                    received_tokens.append(token_name)
+                barrier.wait(timeout=5)
+                req_handler.send_response(200)
+                req_handler.send_header("Content-Type", "text/event-stream")
+                req_handler.send_header("Connection", "close")
+                req_handler.end_headers()
+                req_handler.wfile.write(b"data: ok\n\n")
+            return handler
+
+        scenario = Scenario({
+            "token-b": [make_upstream_handler("token-b")],
+            "token-c": [make_upstream_handler("token-c")],
+        })
+        proxy = self.start_proxy(scenario)
+
+        results = []
+        def send_request():
+            st, body, _ = self.request(proxy, "/v1internal:streamGenerateContent")
+            results.append((st, body))
+
+        t1 = threading.Thread(target=send_request)
+        t2 = threading.Thread(target=send_request)
+        t1.start()
+        t2.start()
+        t1.join(timeout=6)
+        t2.join(timeout=6)
+
+        self.assertEqual(len(results), 2)
+        self.assertTrue(all(st == 200 for st, _ in results))
+
+        # Both concurrent requests must have selected distinct accounts: {token-b, token-c}
+        self.assertEqual(len(received_tokens), 2)
+        self.assertEqual(set(received_tokens), {"token-b", "token-c"})
+        # Persisted cursor must be 'c'
+        self.assertEqual(agy_pool.load_pool().get("round_robin_last_account_id"), "c")
+
+    def test_round_robin_out_of_order_completion_preserves_cursor(self):
+        acc1 = account("a")
+        acc2 = account("b")
+        acc3 = account("c")
+        self.save_accounts([acc1, acc2, acc3])
+        agy_pool.pool_transaction(lambda p: p.update(strategy="round_robin", round_robin_last_account_id="a"))
+
+        # Request 1 (reserving B) will be held until Request 2 (reserving C) has completely finished
+        b_arrived = threading.Event()
+        b_can_finish = threading.Event()
+
+        def b_handler(req_handler):
+            b_arrived.set()
+            b_can_finish.wait(timeout=5)
+            req_handler.send_response(200)
+            req_handler.send_header("Content-Length", "4")
+            req_handler.send_header("Connection", "close")
+            req_handler.end_headers()
+            req_handler.wfile.write(b"ok-b")
+
+        scenario = Scenario({
+            "token-b": [b_handler],
+            "token-c": [(200, b"ok-c", {})],
+        })
+        proxy = self.start_proxy(scenario)
+
+        results = {}
+        def run_req1():
+            st, body, _ = self.request(proxy, "/v1internal:streamGenerateContent")
+            results["req1"] = (st, body)
+
+        t1 = threading.Thread(target=run_req1)
+        t1.start()
+
+        # Wait until Request 1 has reserved B and arrived at upstream
+        self.assertTrue(b_arrived.wait(timeout=5))
+        # Cursor is now B
+        self.assertEqual(agy_pool.load_pool().get("round_robin_last_account_id"), "b")
+
+        # Now execute Request 2 synchronously. It reserves C, dispatches C, and finishes!
+        st2, body2, _ = self.request(proxy, "/v1internal:streamGenerateContent")
+        self.assertEqual((st2, body2), (200, b"ok-c"))
+        # Request 2 completed, cursor is C
+        self.assertEqual(agy_pool.load_pool().get("round_robin_last_account_id"), "c")
+
+        # Now allow Request 1 (which reserved B) to finish later
+        b_can_finish.set()
+        t1.join(timeout=5)
+        self.assertEqual(results["req1"], (200, b"ok-b"))
+
+        # Late completion of B must NOT move cursor backward to B; cursor remains C
+        self.assertEqual(agy_pool.load_pool().get("round_robin_last_account_id"), "c")
+
+    def test_round_robin_failure_does_not_rollback_cursor(self):
+        acc1 = account("a")
+        acc2 = account("b")
+        acc3 = account("c")
+        self.save_accounts([acc1, acc2, acc3])
+        agy_pool.pool_transaction(lambda p: p.update(strategy="round_robin", round_robin_last_account_id="a"))
+
+        # B returns 500 (non-failover error)
+        scenario = Scenario({
+            "token-b": [(500, b"internal server error", {})],
+            "token-c": [(200, b"ok-c", {})],
+        })
+        proxy = self.start_proxy(scenario)
+
+        # Request 1 reserves B; upstream returns 500
+        st, body, _ = self.request(proxy, "/v1internal:streamGenerateContent")
+        self.assertEqual(st, 500)
+        self.assertEqual(body, b"internal server error")
+
+        # Cursor must NOT rollback to A; it remains B
+        self.assertEqual(agy_pool.load_pool().get("round_robin_last_account_id"), "b")
+
+        # Next independent RR request starts after B and chooses C
+        st2, body2, _ = self.request(proxy, "/v1internal:streamGenerateContent")
+        self.assertEqual(st2, 200)
+        self.assertEqual(body2, b"ok-c")
+        self.assertEqual(agy_pool.load_pool().get("round_robin_last_account_id"), "c")
+
+    def test_strategy_isolation_non_rr_does_not_mutate_rr_cursor(self):
+        acc1 = account("a")
+        acc1["last_quota"] = {"remaining_fraction": 0.9}
+        acc2 = account("b")
+        acc2["last_quota"] = {"remaining_fraction": 0.5}
+        self.save_accounts([acc1, acc2])
+        # Set an existing round_robin_last_account_id
+        agy_pool.pool_transaction(lambda p: p.update(strategy="max_quota", round_robin_last_account_id="existing_cursor"))
+
+        scenario = Scenario({
+            "token-a": [(200, b"res-a", {})],
+            "token-b": [(200, b"res-b", {})],
+        })
+        proxy = self.start_proxy(scenario)
+
+        # 1. max_quota dispatches to highest quota (a)
+        st, body, _ = self.request(proxy, "/v1internal:streamGenerateContent")
+        self.assertEqual(st, 200)
+        # Cursor must NOT be overwritten by max_quota
+        self.assertEqual(agy_pool.load_pool().get("round_robin_last_account_id"), "existing_cursor")
+
+        # 2. Switch to least_used
+        agy_pool.pool_transaction(lambda p: p.update(strategy="least_used"))
+        st, body, _ = self.request(proxy, "/v1internal:streamGenerateContent")
+        self.assertEqual(st, 200)
+        # Cursor must NOT be overwritten by least_used
+        self.assertEqual(agy_pool.load_pool().get("round_robin_last_account_id"), "existing_cursor")
+
+    def test_unknown_quota_does_not_beat_known_capacity(self):
+        now = time.time()
+        known = account("known")
+        known["last_quota"] = {
+            "gemini_5h": {"fraction": 0.70, "reset_time": now + 3600},
+            "gemini_weekly": {"fraction": 0.70, "reset_time": now + 86400},
+        }
+        unknown = account("unknown")
+        unknown["last_quota"] = {}
+        ordered = agy_pool.order_candidates([unknown, known], now=now)
+        self.assertEqual([a["id"] for a in ordered], ["known", "unknown"])
+        self.assertEqual(agy_pool.compute_capacity_state(unknown)["known_window_count"], 0)
+
+    def test_known_full_quota_is_distinct_from_unknown(self):
+        full = account("full")
+        full["last_quota"] = {
+            "gemini_5h": {"fraction": 1.0},
+            "gemini_weekly": {"fraction": 1.0},
+        }
+        unknown = account("unknown")
+        unknown["last_quota"] = {}
+        state = agy_pool.compute_capacity_state(full)
+        self.assertEqual(state["known_window_count"], 2)
+        self.assertEqual(agy_pool.compute_capacity_state(unknown)["known_window_count"], 0)
+
+    def test_fallback_5h_refresh_preserves_cached_weekly(self):
+        account_data = account("partial")
+        account_data["last_quota"] = {
+            "gemini_5h": {"fraction": 0.60, "reset_time": "old-5h"},
+            "gemini_weekly": {"fraction": 0.20, "reset_time": "old-weekly"},
+        }
+        fallback = mock.MagicMock()
+        fallback.__enter__.return_value = fallback
+        fallback.read.return_value = json.dumps({
+            "models": {"gemini-3.8-flash-high": {"quotaInfo": {"remainingFraction": 0.80, "resetTime": "new-5h"}}}
+        }).encode()
+        primary_error = urllib.error.HTTPError("https://quota", 500, "error", {}, io.BytesIO(b"temporary"))
+        with mock.patch.object(agy_pool.urllib.request, "urlopen", side_effect=[primary_error, fallback]), mock.patch.object(agy_pool, "refresh_token", return_value="token"):
+            result = agy_pool.query_quota(account_data)
+        self.assertEqual(result["gemini_5h"]["fraction"], 0.80)
+        self.assertEqual(result["gemini_weekly"]["fraction"], 0.20)
+
+    def test_partial_quota_merge_preserves_cached_weekly(self):
+        account_data = account("partial")
+        account_data["last_quota"] = {
+            "gemini_5h": {"fraction": 0.60, "reset_time": "old-5h"},
+            "gemini_weekly": {"fraction": 0.20, "reset_time": "old-weekly"},
+        }
+        merged = agy_pool._cached_quota_state(account_data["last_quota"])
+        merged["gemini_5h"] = {"fraction": 0.80, "reset_time": "new-5h"}
+        agy_pool._recompute_compat_quota(merged)
+        self.assertEqual(merged["gemini_5h"]["fraction"], 0.80)
+        self.assertEqual(merged["gemini_weekly"]["fraction"], 0.20)
+
+    def test_partial_quota_without_cached_weekly_stays_unknown(self):
+        merged = agy_pool._cached_quota_state({})
+        merged["gemini_5h"] = {"fraction": 0.80, "reset_time": None}
+        agy_pool._recompute_compat_quota(merged)
+        self.assertNotIn("gemini_weekly", merged)
+        self.assertEqual(merged["remaining_fraction"], 0.80)
+
+    def test_complete_quota_refresh_failure_does_not_replace_cache(self):
+        account_data = account("cached")
+        cached = {"gemini_5h": {"fraction": 0.40}, "gemini_weekly": {"fraction": 0.30}}
+        account_data["last_quota"] = cached
+        with mock.patch.object(agy_pool, "refresh_token", return_value="token"), \
+             mock.patch.object(agy_pool.urllib.request, "urlopen", side_effect=OSError("offline")):
+            with self.assertRaises(OSError):
+                agy_pool.query_quota(account_data)
+        self.assertEqual(account_data["last_quota"], cached)
+
+    def test_validation_and_auth_are_known_unavailable(self):
+        account_data = account("restricted")
+        state = agy_pool.compute_capacity_state(account_data)
+        self.assertFalse(state["is_depleted"])
+        account_data["last_quota"] = {
+            "gemini_5h": {"fraction": 0.0}, "gemini_weekly": {"fraction": 0.0}
+        }
+        self.assertTrue(agy_pool.compute_capacity_state(account_data)["is_depleted"])
+
+    def test_legacy_remaining_fraction_is_supported(self):
+        state = agy_pool.compute_capacity_state({"last_quota": {"remaining_fraction": 0.4}})
+        self.assertEqual(state["known_window_count"], 1)
+        self.assertEqual(state["q5"], 0.4)
+        self.assertEqual(state["q7"], 0.4)
+
+    def test_unknown_quota_cli_display_is_not_full(self):
+        self.assertIn("N/A", agy_pool.render_progress_bar(None))
+        self.assertNotIn("100.0%", agy_pool.render_progress_bar(None))
+
+    def test_compute_capacity_state_math_and_fallbacks(self):
+        now = 1726400000.0
+
+        # Positive pace (surplus: 60% remaining with 30m left in 5h window)
+        acc_surplus = {
+            "last_quota": {
+                "gemini_5h": {"fraction": 0.60, "reset_time": now + 1800},
+                "gemini_weekly": {"fraction": 0.70, "reset_time": now + 10800},
+            }
+        }
+        cap = agy_pool.compute_capacity_state(acc_surplus, now=now)
+        # r5 = 1800 / 18000 = 0.10 -> pace5 = 0.60 - 0.10 = 0.50
+        self.assertAlmostEqual(cap["pace5"], 0.50, places=4)
+        self.assertAlmostEqual(cap["pace7"], 0.70 - (10800 / 604800.0), places=4)
+        self.assertAlmostEqual(cap["worst_pace"], 0.50, places=4)
+        self.assertFalse(cap["is_depleted"])
+
+        # Clamping: future reset beyond window clamped to r=1.0
+        acc_clamped = {
+            "last_quota": {
+                "gemini_5h": {"fraction": 0.90, "reset_time": now + 36000},  # 10h > 5h
+                "gemini_weekly": {"fraction": 0.90, "reset_time": now + 1000000},  # > 7d
+            }
+        }
+        cap_c = agy_pool.compute_capacity_state(acc_clamped, now=now)
+        self.assertEqual(cap_c["r5"], 1.0)
+        self.assertEqual(cap_c["r7"], 1.0)
+        self.assertAlmostEqual(cap_c["pace5"], -0.10, places=4)
+        self.assertAlmostEqual(cap_c["pace7"], -0.10, places=4)
+
+        # Past/stale reset time (t <= 0) falls back to r=1.0
+        acc_stale = {
+            "last_quota": {
+                "gemini_5h": {"fraction": 0.80, "reset_time": now - 100},
+                "gemini_weekly": {"fraction": 0.80, "reset_time": now},
+            }
+        }
+        cap_s = agy_pool.compute_capacity_state(acc_stale, now=now)
+        self.assertEqual(cap_s["r5"], 1.0)
+        self.assertEqual(cap_s["r7"], 1.0)
+        self.assertAlmostEqual(cap_s["worst_pace"], -0.20, places=4)
+
+        # Missing reset time falls back to r=1.0
+        acc_missing = {"last_quota": {"remaining_fraction": 0.75}}
+        cap_m = agy_pool.compute_capacity_state(acc_missing, now=now)
+        self.assertEqual(cap_m["r5"], 1.0)
+        self.assertEqual(cap_m["r7"], 1.0)
+        self.assertAlmostEqual(cap_m["worst_pace"], -0.25, places=4)
+
+        # Hard quota floor: min(q5, q7) <= 0.005 marks is_depleted = True
+        acc_depleted = {
+            "last_quota": {
+                "gemini_5h": {"fraction": 0.003, "reset_time": now + 60},
+                "gemini_weekly": {"fraction": 0.90, "reset_time": now + 86400},
+            }
+        }
+        cap_d = agy_pool.compute_capacity_state(acc_depleted, now=now)
+        self.assertTrue(cap_d["is_depleted"])
+        self.assertAlmostEqual(cap_d["raw_floor"], 0.003, places=4)
+
+    def test_max_quota_reset_aware_scenarios(self):
+        now = 1726400000.0
+
+        # Scenario A: Misleading high raw quota vs moderate quota resetting soon
+        # Account A: 90% (5h away), 90% (7d away) -> worst pace -0.10
+        # Account B: 60% (30m away), 70% (3h away) -> worst pace +0.50
+        acc_a = account("acc_a")
+        acc_a["last_quota"] = {
+            "gemini_5h": {"fraction": 0.90, "reset_time": now + 18000},
+            "gemini_weekly": {"fraction": 0.90, "reset_time": now + 604800},
+        }
+        acc_b = account("acc_b")
+        acc_b["last_quota"] = {
+            "gemini_5h": {"fraction": 0.60, "reset_time": now + 1800},
+            "gemini_weekly": {"fraction": 0.70, "reset_time": now + 10800},
+        }
+        ordered = agy_pool.order_candidates([acc_a, acc_b], strategy="max_quota", now=now)
+        self.assertEqual([x["id"] for x in ordered], ["acc_b", "acc_a"])
+
+        # Scenario B: Weekly bottleneck protection
+        # Account A: 80% 5h (1h away), 10% weekly (6d away) -> worst pace ≈ -0.757
+        # Account B: 50% 5h (2.5h away), 50% weekly (3.5d away) -> worst pace 0.0
+        acc_a["last_quota"] = {
+            "gemini_5h": {"fraction": 0.80, "reset_time": now + 3600},
+            "gemini_weekly": {"fraction": 0.10, "reset_time": now + (6 * 86400)},
+        }
+        acc_b["last_quota"] = {
+            "gemini_5h": {"fraction": 0.50, "reset_time": now + 9000},
+            "gemini_weekly": {"fraction": 0.50, "reset_time": now + (3.5 * 86400)},
+        }
+        ordered = agy_pool.order_candidates([acc_a, acc_b], strategy="max_quota", now=now)
+        self.assertEqual([x["id"] for x in ordered], ["acc_b", "acc_a"])
+
+        # Scenario C: 5-Hour bottleneck protection
+        # Account A: 15% 5h (4.5h away), 85% weekly (1d away) -> worst pace -0.75
+        # Account B: 40% 5h (2h away), 40% weekly (2d away) -> worst pace 0.0
+        acc_a["last_quota"] = {
+            "gemini_5h": {"fraction": 0.15, "reset_time": now + 16200},
+            "gemini_weekly": {"fraction": 0.85, "reset_time": now + 86400},
+        }
+        acc_b["last_quota"] = {
+            "gemini_5h": {"fraction": 0.40, "reset_time": now + 7200},
+            "gemini_weekly": {"fraction": 0.40, "reset_time": now + (2 * 86400)},
+        }
+        ordered = agy_pool.order_candidates([acc_a, acc_b], strategy="max_quota", now=now)
+        self.assertEqual([x["id"] for x in ordered], ["acc_b", "acc_a"])
+
+        # Scenario D: Hard depletion floor overrides pace score
+        # Account A: 0.2% quota resetting in 1 minute (depleted)
+        # Account B: 20% quota resetting in 4 hours (healthy eligible)
+        acc_a["last_quota"] = {
+            "gemini_5h": {"fraction": 0.002, "reset_time": now + 60},
+            "gemini_weekly": {"fraction": 0.80, "reset_time": now + 86400},
+        }
+        acc_b["last_quota"] = {
+            "gemini_5h": {"fraction": 0.20, "reset_time": now + 14400},
+            "gemini_weekly": {"fraction": 0.20, "reset_time": now + (5 * 86400)},
+        }
+        ordered = agy_pool.order_candidates([acc_a, acc_b], strategy="max_quota", now=now)
+        self.assertEqual([x["id"] for x in ordered], ["acc_b", "acc_a"])
+
+        # Scenario E: Missing reset time fallback
+        # Account A has 80% with no reset (worst_pace = -0.20)
+        # Account B has 70% with reset in 1h 5h and 1d weekly (worst_pace = +0.50)
+        acc_a["last_quota"] = {"remaining_fraction": 0.80}
+        acc_b["last_quota"] = {
+            "gemini_5h": {"fraction": 0.70, "reset_time": now + 3600},
+            "gemini_weekly": {"fraction": 0.70, "reset_time": now + 86400},
+        }
+        ordered = agy_pool.order_candidates([acc_a, acc_b], strategy="max_quota", now=now)
+        self.assertEqual([x["id"] for x in ordered], ["acc_b", "acc_a"])
+
+        # Both missing reset: raw quota ranking preserved
+        acc_b["last_quota"] = {"remaining_fraction": 0.70}
+        ordered = agy_pool.order_candidates([acc_a, acc_b], strategy="max_quota", now=now)
+        self.assertEqual([x["id"] for x in ordered], ["acc_a", "acc_b"])
+
+        # Scenario F: Stable exact tie
+        acc_1 = account("acc_1")
+        acc_1["last_quota"] = {"remaining_fraction": 0.80}
+        acc_2 = account("acc_2")
+        acc_2["last_quota"] = {"remaining_fraction": 0.80}
+        ordered = agy_pool.order_candidates([acc_1, acc_2], strategy="max_quota", now=now)
+        self.assertEqual([x["id"] for x in ordered], ["acc_1", "acc_2"])
+
+    def test_least_used_reset_aware_tie_breaking(self):
+        now = 1726400000.0
+        # Hits is primary: lower hits account always selected first
+        acc_few_hits = account("few_hits")
+        acc_few_hits["gen_count"] = 1
+        acc_few_hits["last_quota"] = {
+            "gemini_5h": {"fraction": 0.20, "reset_time": now + 14400},
+            "gemini_weekly": {"fraction": 0.20, "reset_time": now + 400000},
+        }
+        acc_many_hits = account("many_hits")
+        acc_many_hits["gen_count"] = 10
+        acc_many_hits["last_quota"] = {
+            "gemini_5h": {"fraction": 0.90, "reset_time": now + 1800},
+            "gemini_weekly": {"fraction": 0.90, "reset_time": now + 10800},
+        }
+        ordered = agy_pool.order_candidates([acc_many_hits, acc_few_hits], strategy="least_used", now=now)
+        self.assertEqual([x["id"] for x in ordered], ["few_hits", "many_hits"])
+
+        # Equal hits: reset-aware capacity pace tie-breaks
+        acc_low_cap = account("low_cap")
+        acc_low_cap["gen_count"] = 3
+        acc_low_cap["last_quota"] = {
+            "gemini_5h": {"fraction": 0.30, "reset_time": now + 14400},  # worst_pace = 0.30 - 0.80 = -0.50
+            "gemini_weekly": {"fraction": 0.80, "reset_time": now + 86400},
+        }
+        acc_high_cap = account("high_cap")
+        acc_high_cap["gen_count"] = 3
+        acc_high_cap["last_quota"] = {
+            "gemini_5h": {"fraction": 0.60, "reset_time": now + 1800},   # worst_pace = 0.60 - 0.10 = +0.50
+            "gemini_weekly": {"fraction": 0.80, "reset_time": now + 86400},
+        }
+        ordered = agy_pool.order_candidates([acc_low_cap, acc_high_cap], strategy="least_used", now=now)
+        self.assertEqual([x["id"] for x in ordered], ["high_cap", "low_cap"])
+
+    def test_max_quota_full_precision_beats_hits(self):
+        now = 1726400000.0
+        # A: worst_pace = 0.014, hits = 100
+        # B: worst_pace = 0.011, hits = 0
+        # 5h window: W5 = 18000s, reset at now + 9000 (r5 = 0.5)
+        # weekly window: W7 = 604800s, reset at now + 302400 (r7 = 0.5)
+        acc_a = account("acc_a")
+        acc_a["gen_count"] = 100
+        acc_a["last_quota"] = {
+            "gemini_5h": {"fraction": 0.514, "reset_time": now + 9000},
+            "gemini_weekly": {"fraction": 0.514, "reset_time": now + 302400},
+        }
+        acc_b = account("acc_b")
+        acc_b["gen_count"] = 0
+        acc_b["last_quota"] = {
+            "gemini_5h": {"fraction": 0.511, "reset_time": now + 9000},
+            "gemini_weekly": {"fraction": 0.511, "reset_time": now + 302400},
+        }
+        # A has worst_pace 0.014 > B's 0.011; full precision must not round to 0.01 and let Hits decide
+        ordered = agy_pool.order_candidates([acc_b, acc_a], strategy="max_quota", now=now)
+        self.assertEqual([x["id"] for x in ordered], ["acc_a", "acc_b"])
+
+    def test_max_quota_total_pace_beats_hits(self):
+        now = 1726400000.0
+        # A: worst_pace = 0.10, total_pace = 0.40, hits = 100
+        # B: worst_pace = 0.10, total_pace = 0.20, hits = 0
+        acc_a = account("acc_a")
+        acc_a["gen_count"] = 100
+        acc_a["last_quota"] = {
+            "gemini_5h": {"fraction": 0.60, "reset_time": now + 9000},       # pace5 = 0.60 - 0.50 = 0.10
+            "gemini_weekly": {"fraction": 0.80, "reset_time": now + 302400}, # pace7 = 0.80 - 0.50 = 0.30
+        }
+        acc_b = account("acc_b")
+        acc_b["gen_count"] = 0
+        acc_b["last_quota"] = {
+            "gemini_5h": {"fraction": 0.60, "reset_time": now + 9000},       # pace5 = 0.60 - 0.50 = 0.10
+            "gemini_weekly": {"fraction": 0.60, "reset_time": now + 302400}, # pace7 = 0.60 - 0.50 = 0.10
+        }
+        # Equal worst_pace (0.10), A has higher total_pace (0.40 > 0.20); must evaluate before Hits
+        ordered = agy_pool.order_candidates([acc_b, acc_a], strategy="max_quota", now=now)
+        self.assertEqual([x["id"] for x in ordered], ["acc_a", "acc_b"])
+
+    def test_max_quota_raw_floor_beats_hits(self):
+        now = 1726400000.0
+        # A: worst_pace = 0.25, total_pace = 0.50, raw_floor = 0.75, hits = 50
+        # B: worst_pace = 0.25, total_pace = 0.50, raw_floor = 0.50, hits = 0
+        # Using exact dyadic fractions (powers of 2) for zero floating-point representation error:
+        acc_a = account("acc_a")
+        acc_a["gen_count"] = 50
+        acc_a["last_quota"] = {
+            "gemini_5h": {"fraction": 0.75, "reset_time": now + 9000},       # r5 = 0.50 -> pace5 = 0.25
+            "gemini_weekly": {"fraction": 0.75, "reset_time": now + 302400}, # r7 = 0.50 -> pace7 = 0.25
+        }
+        acc_b = account("acc_b")
+        acc_b["gen_count"] = 0
+        acc_b["last_quota"] = {
+            "gemini_5h": {"fraction": 0.50, "reset_time": now + 4500},       # r5 = 0.25 -> pace5 = 0.25
+            "gemini_weekly": {"fraction": 0.875, "reset_time": now + 378000},# r7 = 0.625 -> pace7 = 0.25
+        }
+        # Equal worst_pace (0.25) and total_pace (0.50); A has higher raw_floor (0.75 > 0.50); must evaluate before Hits
+        ordered = agy_pool.order_candidates([acc_b, acc_a], strategy="max_quota", now=now)
+        self.assertEqual([x["id"] for x in ordered], ["acc_a", "acc_b"])
+
+    def test_max_quota_hits_remains_final_capacity_tie_break(self):
+        now = 1726400000.0
+        acc_a = account("acc_a")
+        acc_a["gen_count"] = 25
+        acc_a["last_quota"] = {
+            "gemini_5h": {"fraction": 0.70, "reset_time": now + 9000},
+            "gemini_weekly": {"fraction": 0.70, "reset_time": now + 302400},
+        }
+        acc_b = account("acc_b")
+        acc_b["gen_count"] = 5
+        acc_b["last_quota"] = {
+            "gemini_5h": {"fraction": 0.70, "reset_time": now + 9000},
+            "gemini_weekly": {"fraction": 0.70, "reset_time": now + 302400},
+        }
+        # Identical capacity metrics: lower Hits (acc_b with 5 < 25) must rank first
+        ordered = agy_pool.order_candidates([acc_a, acc_b], strategy="max_quota", now=now)
+        self.assertEqual([x["id"] for x in ordered], ["acc_b", "acc_a"])
+
+    def test_max_quota_exact_full_tie_preserves_stable_order(self):
+        now = 1726400000.0
+        acc_1 = account("first")
+        acc_1["gen_count"] = 10
+        acc_1["last_quota"] = {"remaining_fraction": 0.85}
+        acc_2 = account("second")
+        acc_2["gen_count"] = 10
+        acc_2["last_quota"] = {"remaining_fraction": 0.85}
+
+        # Original order [first, second] preserved
+        ordered_1 = agy_pool.order_candidates([acc_1, acc_2], strategy="max_quota", now=now)
+        self.assertEqual([x["id"] for x in ordered_1], ["first", "second"])
+
+        # Original order [second, first] preserved
+        ordered_2 = agy_pool.order_candidates([acc_2, acc_1], strategy="max_quota", now=now)
+        self.assertEqual([x["id"] for x in ordered_2], ["second", "first"])
+
 
 if __name__ == "__main__":
     unittest.main()
-
