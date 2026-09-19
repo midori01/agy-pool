@@ -1356,10 +1356,17 @@ class AgyPoolTest(unittest.TestCase):
         # 1. Explicit friendly name
         self.assertEqual(agy_pool.display_account_name({"name": "Work", "id": "acc_1", "email": "user@secret.com"}), "Work")
         self.assertEqual(agy_pool.display_account_name({"name": "  Project Lead  ", "id": "acc_2"}), "Project Lead")
-        # 2. Safe fallback for acc_N
+        # 2. Fallback to id_token JWT payload name if name is None
+        jwt_payload = base64.urlsafe_b64encode(json.dumps({"name": "JWT Profile Name"}).encode()).decode().rstrip("=")
+        fake_id_token = f"header.{jwt_payload}.signature"
+        self.assertEqual(
+            agy_pool.display_account_name({"name": None, "id": "acc_1", "email": "user@secret.com", "id_token": fake_id_token}),
+            "JWT Profile Name"
+        )
+        # 3. Safe fallback for acc_N
         self.assertEqual(agy_pool.display_account_name({"name": None, "id": "acc_1", "email": "user@secret.com"}), "Account 1")
         self.assertEqual(agy_pool.display_account_name({"name": "", "id": "acc_42", "email": "user@secret.com"}), "Account 42")
-        # 3. Generic safe fallback
+        # 4. Generic safe fallback
         self.assertEqual(agy_pool.display_account_name({"name": None, "id": "custom_uuid", "email": "user@secret.com"}), "Account")
         self.assertEqual(agy_pool.display_account_name({}), "Account")
         self.assertEqual(agy_pool.display_account_name(None), "Account")
@@ -2555,6 +2562,62 @@ class AgyPoolTest(unittest.TestCase):
         out = buf.getvalue()
         self.assertIn("⚡ Quota Runway & Endurance Forecast:", out)
         self.assertIn("Health & Pace:", out)
+
+    def test_rename_account_updates_and_clears_name(self):
+        acc1 = account("acc_1")
+        acc1["name"] = "Initial Name"
+        self.save_accounts([acc1])
+
+        # Rename by index
+        self.assertTrue(agy_pool.rename_account("1", "Custom Alias"))
+        pool = agy_pool.load_pool()
+        self.assertEqual(pool["accounts"][0]["name"], "Custom Alias")
+
+        # Rename by ID
+        self.assertTrue(agy_pool.rename_account("acc_1", "Updated Name"))
+        pool = agy_pool.load_pool()
+        self.assertEqual(pool["accounts"][0]["name"], "Updated Name")
+
+        # Clear name
+        self.assertTrue(agy_pool.rename_account("1", ""))
+        pool = agy_pool.load_pool()
+        self.assertIsNone(pool["accounts"][0]["name"])
+
+        # Non-existent account
+        self.assertFalse(agy_pool.rename_account("999", "Whatever"))
+
+    def test_fetch_google_profile_name_and_backfill_account_names(self):
+        # 1. fetch_google_profile_name
+        class DummyResponse:
+            def __enter__(self):
+                return self
+            def __exit__(self, *args):
+                pass
+            def read(self):
+                return json.dumps({"name": "Google User", "email": "test@example.com"}).encode()
+
+        with mock.patch("urllib.request.urlopen", return_value=DummyResponse()):
+            name = agy_pool.fetch_google_profile_name("mock_access_token")
+            self.assertEqual(name, "Google User")
+
+        # 2. backfill_account_names from id_token
+        jwt_payload = base64.urlsafe_b64encode(json.dumps({"name": "From JWT"}).encode()).decode().rstrip("=")
+        fake_id_token = f"header.{jwt_payload}.signature"
+        acc_jwt = account("acc_jwt")
+        acc_jwt["name"] = None
+        acc_jwt["id_token"] = fake_id_token
+
+        # 3. backfill_account_names from access_token via fetch_google_profile_name
+        acc_api = account("acc_api")
+        acc_api["name"] = None
+        acc_api["access_token"] = "valid_tok"
+
+        pool_state = {"accounts": [acc_jwt, acc_api]}
+        with mock.patch.object(agy_pool, "fetch_google_profile_name", return_value="From API"):
+            changed = agy_pool.backfill_account_names(pool_state)
+            self.assertTrue(changed)
+            self.assertEqual(pool_state["accounts"][0]["name"], "From JWT")
+            self.assertEqual(pool_state["accounts"][1]["name"], "From API")
 
 
 if __name__ == "__main__":
