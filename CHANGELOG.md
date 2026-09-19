@@ -5,6 +5,18 @@ All notable changes to the `agy-pool` project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.0-beta.2] - 2026-09-19
+
+### Added
+- **Quota Runway & Endurance Forecasting Engine**:
+  - Implemented event-driven chronological simulation modeling rolling consumption against staggered account reset times.
+  - Telemetry tracking capturing recent inference frequency across 15m, 1h, and 4h rolling windows to compute real-time burn rates.
+  - Multi-window bottleneck detection differentiating between 5-hour rolling burst limits and 7-day total weekly capacity constraints.
+  - Natural capacity replenishment modeling identifying infinite sustainable endurance when aggregate staggered reset inflow exceeds demand.
+  - Added `agy-pool forecast` CLI command (aliases: `runway`, `predict`) supporting custom workload simulation (`--pace <N>`) and structured output (`--json`).
+  - Integrated compact runway summary block directly into `agy-pool quota`, `status`, and `list` dashboards.
+  - Expanded automated test coverage from 86 to 95 tests covering all forecasting scenarios and edge cases.
+
 ## [0.1.0-beta] - 2026-09-19
 
 ### Added
@@ -17,14 +29,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Provably Uncommitted Transport Failover & Anti-Replay Protection**:
   - Transparently fails over for provably uncommitted network errors (DNS resolution failure, connection refusal `ECONNREFUSED`, network unreachable, and early TLS setup failures).
   - Enforces strict no-replay semantics on ambiguous transport timeouts and mid-stream disconnects, returning 504/502 to eliminate duplicate token generation and accidental double quota consumption.
-- **Quota Runway & Endurance Forecasting Engine**:
-  - Implemented event-driven chronological simulation modeling rolling consumption against staggered account reset times.
-  - Telemetry tracking capturing recent inference frequency across 15m, 1h, and 4h rolling windows to compute real-time burn rates.
-  - Multi-window bottleneck detection differentiating between 5-hour rolling burst limits and 7-day total weekly capacity constraints.
-  - Natural capacity replenishment modeling identifying infinite sustainable endurance when aggregate staggered reset inflow exceeds demand.
-  - Added `agy-pool forecast` CLI command (aliases: `runway`, `predict`) supporting custom workload simulation (`--pace <N>`) and structured output (`--json`).
-  - Integrated compact runway summary block directly into `agy-pool quota`, `status`, and `list` dashboards.
-  - Expanded automated test coverage from 86 to 95 tests covering all forecasting scenarios and edge cases.
 - **Account Privacy Masking & Configurable Visibility**:
   - Automatically masks raw Google account email addresses in terminal status dashboards and proxy logs behind user-configured friendly names or anonymous fallback aliases (`Account 1`, `Account 2`).
   - Added multi-tier privacy visibility controls: `agy-pool config show_email <true|false>`, `AGY_SHOW_EMAIL` environment variable, and `--show-email` / `--hide-email` CLI arguments on `status` and `quota`.
