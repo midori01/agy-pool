@@ -2768,6 +2768,158 @@ class AgyPoolTest(unittest.TestCase):
         self.assertGreater(acc_forecast["reset5_in_sec"], 0)
         self.assertGreater(acc_forecast["resetw_in_sec"], 0)
 
+    def test_visible_width_and_fit_term_string_cjk(self):
+        # Pure ASCII
+        self.assertEqual(agy_pool._str_visible_width("hello"), 5)
+        self.assertEqual(agy_pool._fit_term_string("hello", 8), "hello   ")
+
+        # CJK characters (each takes 2 columns)
+        cjk = "吳秀娥"
+        self.assertEqual(agy_pool._str_visible_width(cjk), 6)
+        self.assertEqual(agy_pool._fit_term_string(cjk, 10), "吳秀娥    ")
+        # Truncation with ellipsis
+        truncated = agy_pool._fit_term_string(cjk, 5)
+        self.assertEqual(agy_pool._str_visible_width(truncated), 5)
+        self.assertTrue(truncated.endswith("… ") or truncated.endswith("…"))
+
+        # String with ANSI escape codes (escape codes should have 0 visible width)
+        colored = f"{agy_pool.CLR_GREEN}Hello{agy_pool.CLR_RESET}"
+        self.assertEqual(agy_pool._str_visible_width(colored), 5)
+        self.assertEqual(agy_pool._fit_term_string(colored, 7), colored + "  ")
+
+    def test_render_top_frame_standard_and_compact(self):
+        acc1 = account("acc1")
+        acc1["name"] = "Alice"
+        acc1["last_quota"] = {
+            "gemini_5h": {"fraction": 0.85, "reset_time": time.time() + 3600},
+            "gemini_weekly": {"fraction": 0.90, "reset_time": time.time() + 86400},
+        }
+        acc2 = account("acc2")
+        acc2["name"] = "ミドリ（緑）"
+        acc2["last_quota"] = {
+            "gemini_5h": {"fraction": 0.20, "reset_time": time.time() + 1800},
+            "gemini_weekly": {"fraction": 0.50, "reset_time": time.time() + 43200},
+        }
+        pool = {
+            "accounts": [acc1, acc2],
+            "active_account_id": "acc1",
+            "strategy": "max_quota"
+        }
+
+        # Standard layout (>= 85 cols)
+        frame_std = agy_pool.render_top_frame(
+            pool,
+            interval=2.0,
+            paused=False,
+            term_size=(85, 24),
+            in_flight_map={"acc1": 1}
+        )
+        self.assertIn("agy-pool top", frame_std)
+        self.assertIn("Alice", frame_std)
+        self.assertIn("ミドリ", frame_std)
+        self.assertIn("In-Flight:", frame_std)
+        self.assertIn("⚡ Running", frame_std)
+        self.assertIn("Quit", frame_std)
+
+        # Compact layout (< 85 cols, mobile portrait)
+        frame_compact = agy_pool.render_top_frame(
+            pool,
+            interval=1.5,
+            paused=True,
+            term_size=(60, 24),
+            in_flight_map={}
+        )
+        self.assertIn("[PAUSED]", frame_compact)
+        self.assertIn("Alice", frame_compact)
+        self.assertIn("5H QUOTA", frame_compact)
+
+        # Zero-overflow & responsive margin across all terminal widths from 50 to 110
+        for cols in (50, 52, 55, 60, 70, 75, 80, 85, 88, 90, 100):
+            f = agy_pool.render_top_frame(pool, term_size=(cols, 24), in_flight_map={"acc1": 1})
+            lines = f.split("\n")
+            for line in lines:
+                self.assertLessEqual(agy_pool._str_visible_width(line), cols)
+            if cols >= 60:
+                self.assertIn("⚡ Running", f)
+                self.assertNotIn("Runnin…", f)
+
+        # Empty pool
+        empty_frame = agy_pool.render_top_frame({"accounts": []}, term_size=(80, 24))
+        self.assertIn("No accounts in pool yet", empty_frame)
+
+    def test_run_top_once_mode(self):
+        buf = io.StringIO()
+        pool = {"accounts": [account("test")], "strategy": "max_quota"}
+        with mock.patch("sys.stdout", buf), mock.patch.object(agy_pool, "load_pool", return_value=pool):
+            agy_pool.run_top(once=True, show_email=True)
+        out = buf.getvalue()
+        self.assertIn("agy-pool top", out)
+        self.assertIn("test@example.test", out)
+
+    def test_proxy_internal_stats_endpoint(self):
+        proxy = self.start_server(agy_pool.SmartProxyHandler)
+        with mock.patch.object(agy_pool, "get_all_in_flight_counts", return_value={"acc1": 2}):
+            status, body, _ = self.request(proxy, "/_agy_pool/stats")
+
+        self.assertEqual(status, 200)
+        data = json.loads(body.decode("utf-8"))
+        self.assertEqual(data.get("status"), "ok")
+        self.assertEqual(data.get("version"), agy_pool.VERSION)
+        self.assertEqual(data.get("in_flight"), {"acc1": 2})
+
+    def test_status_watch_and_tip(self):
+        pool = {"accounts": [account("test")], "strategy": "max_quota"}
+        buf = io.StringIO()
+        with mock.patch("sys.stdout", buf), \
+             mock.patch.object(agy_pool, "load_pool", return_value=pool), \
+             mock.patch.object(agy_pool, "is_daemon_running", return_value=False), \
+             mock.patch.object(agy_pool, "_safe_quota", return_value=True):
+            agy_pool.list_accounts()
+        out = buf.getvalue()
+        self.assertIn("💡 Tip: Run 'agy-pool status -w'", out)
+
+        with mock.patch.object(agy_pool, "run_top") as mock_top, \
+             mock.patch("sys.argv", ["agy-pool", "status", "-w", "-i", "1.5"]):
+            agy_pool.main()
+        mock_top.assert_called_once_with(interval=1.5, show_email=None)
+
+    def test_fit_term_string_ansi_and_cjk(self):
+        # ANSI colors should not leak or distort character width
+        colored = "\033[32m* Active Extra Long Status\033[0m"
+        fitted = agy_pool._fit_term_string(colored, 12)
+        self.assertEqual(agy_pool._str_visible_width(fitted), 12)
+        self.assertTrue(fitted.endswith(agy_pool.CLR_RESET))
+
+        # CJK characters width truncation
+        cjk_str = "吳秀娥（수아・日）"
+        fitted_cjk = agy_pool._fit_term_string(cjk_str, 10)
+        self.assertEqual(agy_pool._str_visible_width(fitted_cjk), 10)
+
+    def test_render_progress_bar_alignment(self):
+        bar_full = agy_pool.render_progress_bar(1.0, width=10)
+        bar_none = agy_pool.render_progress_bar(None, width=10)
+        self.assertEqual(agy_pool._str_visible_width(bar_full), agy_pool._str_visible_width(bar_none))
+
+    def test_top_interval_config_persistence(self):
+        buf = io.StringIO()
+        with mock.patch("sys.stdout", buf):
+            agy_pool.manage_config("top_interval", "3.5")
+        pool = agy_pool.load_pool()
+        self.assertEqual(pool.get("top_interval"), 3.5)
+
+        buf = io.StringIO()
+        with mock.patch("sys.stdout", buf):
+            agy_pool.manage_config("interval", "2.5")
+        pool = agy_pool.load_pool()
+        self.assertEqual(pool.get("top_interval"), 2.5)
+
+    def test_trigger_background_quota_refresh(self):
+        acc = account("t1")
+        with mock.patch.object(agy_pool, "_safe_quota", return_value=True) as mock_sq:
+            t = agy_pool.trigger_background_quota_refresh(acc)
+            t.join(timeout=2.0)
+            mock_sq.assert_called_once()
+
 
 if __name__ == "__main__":
     unittest.main()

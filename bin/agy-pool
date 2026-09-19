@@ -33,6 +33,9 @@ import http.client
 import tempfile
 import errno
 import collections
+import unicodedata
+import select
+import re
 from datetime import datetime, timezone
 
 try:
@@ -41,8 +44,15 @@ try:
 except ImportError:
     HAS_FCNTL = False
 
+try:
+    import termios
+    import tty
+    HAS_TERMIOS = True
+except ImportError:
+    HAS_TERMIOS = False
+
 # ----------------- Constants & Configuration -----------------
-VERSION = "0.1.0-beta.4"
+VERSION = "0.1.0-beta.5"
 QUOTA_FRESH_MAX_AGE = 60
 QUOTA_AGING_MAX_AGE = 300
 _QUOTA_REFRESH_LOCK = threading.Lock()
@@ -260,6 +270,69 @@ CLR_MAGENTA = "\033[35m"
 CLR_CYAN = "\033[36m"
 CLR_RED = "\033[31m"
 
+# ANSI Terminal & Cursor Control
+ESC_CURSOR_HIDE = "\033[?25l"
+ESC_CURSOR_SHOW = "\033[?25h"
+ESC_CLEAR_SCREEN = "\033[2J"
+ESC_CURSOR_HOME = "\033[H"
+ESC_CLEAR_LINE = "\033[K"
+ESC_CLEAR_DOWN = "\033[J"
+
+_ANSI_ESCAPE_RE = re.compile(r'\x1b\[[0-9;?]*[a-zA-Z]')
+
+def _char_term_width(ch):
+    w = unicodedata.east_asian_width(ch)
+    return 2 if w in ('W', 'F') else 1
+
+def _str_visible_width(s):
+    clean = _ANSI_ESCAPE_RE.sub('', s)
+    return sum(_char_term_width(c) for c in clean)
+
+def _fit_term_string(s, target_width, align="left", fill=" "):
+    """Truncate or pad string to exact visible terminal width, handling ANSI and CJK correctly."""
+    v_width = _str_visible_width(s)
+    if v_width == target_width:
+        return s
+    if v_width < target_width:
+        pad = fill * (target_width - v_width)
+        return s + pad if align == "left" else pad + s
+
+    tokens = []
+    last_end = 0
+    has_ansi = False
+    for m in _ANSI_ESCAPE_RE.finditer(s):
+        has_ansi = True
+        if m.start() > last_end:
+            tokens.append((False, s[last_end:m.start()]))
+        tokens.append((True, m.group(0)))
+        last_end = m.end()
+    if last_end < len(s):
+        tokens.append((False, s[last_end:]))
+
+    cur_w = 0
+    res = []
+    truncated = False
+    for is_ansi, token in tokens:
+        if is_ansi:
+            res.append(token)
+            continue
+        for c in token:
+            cw = _char_term_width(c)
+            if cur_w + cw > target_width - 1:
+                res.append("…")
+                cur_w += 1
+                truncated = True
+                break
+            res.append(c)
+            cur_w += cw
+        if truncated:
+            break
+    if has_ansi and truncated:
+        res.append(CLR_RESET)
+    if cur_w < target_width:
+        res.append(fill * (target_width - cur_w))
+    return "".join(res)
+
 
 def ensure_dirs():
     _assert_safe_write_path(GEMINI_DIR)
@@ -274,7 +347,8 @@ def _empty_pool():
         "version": 1,
         "strategy": "max_quota",  # max_quota | round_robin
         "active_account_id": None,
-        "accounts": []
+        "accounts": [],
+        "top_interval": 2.0
     }
 
 
@@ -873,9 +947,24 @@ def format_remaining_time(iso_reset_time):
         return str(iso_reset_time)[:16]
 
 
-def render_progress_bar(fraction, width=10):
+def render_progress_bar(fraction, width=10, compact=False):
+    if compact:
+        if fraction is None:
+            return f"{CLR_DIM}[{'░' * width}]  N/A{CLR_RESET}"
+        fraction = max(0.0, min(1.0, float(fraction)))
+        filled = int(round(fraction * width))
+        bar = "█" * filled + "░" * (width - filled)
+        pct = f"{int(round(fraction * 100)):>3}%"
+        if fraction > 0.4:
+            color = CLR_GREEN
+        elif fraction > 0.15:
+            color = CLR_YELLOW
+        else:
+            color = CLR_RED
+        return f"{color}[{bar}] {pct}{CLR_RESET}"
+
     if fraction is None:
-        return f"{CLR_DIM}[{'░' * width}]   N/A{CLR_RESET}"
+        return f"{CLR_DIM}[{'░' * width}]    N/A{CLR_RESET}"
     fraction = max(0.0, min(1.0, float(fraction)))
     filled = int(round(fraction * width))
     bar = "█" * filled + "░" * (width - filled)
@@ -1317,6 +1406,14 @@ def list_accounts(target=None, show_email=None):
 
     daemon_running = is_daemon_running()
     gateway_status = f"{CLR_GREEN}RUNNING (127.0.0.1:{DEFAULT_PORT}){CLR_RESET}" if daemon_running else f"{CLR_DIM}STOPPED{CLR_RESET}"
+    in_flight_map = {}
+    if daemon_running:
+        try:
+            req = urllib.request.Request(f"http://127.0.0.1:{DEFAULT_PORT}/_agy_pool/stats")
+            with urllib.request.urlopen(req, timeout=0.1) as resp:
+                in_flight_map = json.loads(resp.read().decode()).get("in_flight", {})
+        except Exception:
+            pass
 
     sep = "=" * 68
     sub_sep = "-" * 68
@@ -1348,6 +1445,8 @@ def list_accounts(target=None, show_email=None):
         is_exhausted = any(fraction is not None and fraction <= 0.005 for fraction in (g5_frac, gw_frac))
 
         hits = acc.get("gen_count", acc.get("request_count", 0))
+        flt = in_flight_map.get(acc_id, 0)
+        flt_tag = f"  {CLR_BOLD}{CLR_CYAN}[⚡ Running ({flt})]{CLR_RESET}" if flt > 0 else ""
 
         if status == "validation_required":
             marker = f"{CLR_YELLOW}⚠ Verify Required{CLR_RESET}"
@@ -1363,7 +1462,7 @@ def list_accounts(target=None, show_email=None):
             marker = f"{CLR_CYAN}Ready{CLR_RESET}"
         disp_name = display_account_name(acc, show_email=show_email)
 
-        print(f"{CLR_BOLD}[{i}] {disp_name}{CLR_RESET}  [{marker}]  Hits: {hits}")
+        print(f"{CLR_BOLD}[{i}] {disp_name}{CLR_RESET}  [{marker}]{flt_tag}  Hits: {hits}")
 
         if status == "validation_required":
             print(f"    • Gemini 5-Hour: {CLR_YELLOW}[░░░░░░░░░░]  Action Required (Blocked){CLR_RESET}")
@@ -1392,6 +1491,7 @@ def list_accounts(target=None, show_email=None):
     print(f" {CLR_YELLOW}[Cooldown]{CLR_RESET} {CLR_DIM}Rate Limited{CLR_RESET}      {CLR_DIM}[Exhausted] Quota Depleted{CLR_RESET}")
     print(f" Strategy: {CLR_BOLD}{pool.get('strategy', 'max_quota')}{CLR_RESET} | Gateway Proxy: {gateway_status}")
     print_runway_summary(pool, now=now_ts)
+    print(f" {CLR_DIM}💡 Tip: Run 'agy-pool status -w' (or 'agy-pool top') for live real-time dashboard.{CLR_RESET}")
     print(sep + "\n")
 
 
@@ -1411,6 +1511,13 @@ def _safe_quota(account):
         return True
     except Exception:
         return False
+
+
+def trigger_background_quota_refresh(account):
+    """Trigger an asynchronous quota refresh in a background daemon thread."""
+    t = threading.Thread(target=_safe_quota, args=(dict(account),), daemon=True)
+    t.start()
+    return t
 
 
 def remove_account(target):
@@ -1951,11 +2058,13 @@ def manage_config(key=None, value=None):
         env_str = f" ({', '.join(env_info)})" if env_info else ""
 
         print(f"\n{CLR_BOLD}=== agy-pool Configuration ==={CLR_RESET}")
-        print(f"  • {CLR_CYAN}show_email{CLR_RESET}: {show_email_eff} [Config: {show_email_cfg if show_email_cfg is not None else '<default: False>'}{env_str}]")
-        print(f"  • {CLR_CYAN}strategy{CLR_RESET}:   {strategy}")
+        print(f"  • {CLR_CYAN}show_email{CLR_RESET}:   {show_email_eff} [Config: {show_email_cfg if show_email_cfg is not None else '<default: False>'}{env_str}]")
+        print(f"  • {CLR_CYAN}strategy{CLR_RESET}:     {strategy}")
+        print(f"  • {CLR_CYAN}top_interval{CLR_RESET}: {pool.get('top_interval', 2.0):.1f}s")
         print(f"\nUsage:")
         print(f"  agy-pool config show_email <true|false|on|off>")
-        print(f"  agy-pool config strategy <max_quota|round_robin|least_used>\n")
+        print(f"  agy-pool config strategy <max_quota|round_robin|least_used>")
+        print(f"  agy-pool config top_interval <seconds (0.5 - 60.0)>\n")
         return
 
     k = key.strip().lower().replace("-", "_")
@@ -1982,9 +2091,25 @@ def manage_config(key=None, value=None):
             p["strategy"] = val
         pool_transaction(update)
         print(f"{CLR_GREEN}✓ Configuration updated: strategy = {val}{CLR_RESET}")
+    elif k in ("top_interval", "interval"):
+        if value is None:
+            print(f"top_interval: {pool.get('top_interval', 2.0):.1f}s")
+            return
+        try:
+            val = float(value)
+            if val < 0.5 or val > 60.0:
+                raise ValueError()
+        except ValueError:
+            print(f"{CLR_RED}[Error] Invalid interval '{value}'. Allowed range: 0.5 to 60.0 seconds.{CLR_RESET}")
+            sys.exit(1)
+        val = round(val, 1)
+        def update(p):
+            p["top_interval"] = val
+        pool_transaction(update)
+        print(f"{CLR_GREEN}✓ Configuration updated: top_interval = {val:.1f}s{CLR_RESET}")
     else:
         print(f"{CLR_RED}[Error] Unknown configuration key: {key}{CLR_RESET}")
-        print("Supported keys: show_email, strategy")
+        print("Supported keys: show_email, strategy, top_interval")
         sys.exit(1)
 
 
@@ -3140,6 +3265,488 @@ def show_forecast(pace=None, json_output=False):
     print(sep + "\n")
 
 
+# ----------------- Interactive TUI Top Monitor -----------------
+def render_top_frame(pool, interval=2.0, paused=False, show_email=None, term_size=None, in_flight_map=None, now_ts=None, status_msg=None):
+    if now_ts is None:
+        now_ts = time.time()
+    if in_flight_map is None:
+        in_flight_map = {}
+
+    term_cols, term_lines = term_size or shutil.get_terminal_size((80, 24))
+    width = max(50, min(term_cols, 100))
+    is_compact = width < 85
+    is_short = term_lines < 23
+
+    accounts = pool.get("accounts", []) if isinstance(pool, dict) else []
+    active_id = pool.get("active_account_id") if isinstance(pool, dict) else None
+    strategy = pool.get("strategy", "max_quota") if isinstance(pool, dict) else "max_quota"
+
+    daemon_info = get_daemon_info()
+    is_running = daemon_info and is_port_listening()
+    if is_running:
+        gw_tag = f"{CLR_GREEN}● RUNNING ({daemon_info['pid']}){CLR_RESET}"
+    else:
+        gw_tag = f"{CLR_YELLOW}○ STOPPED{CLR_RESET}"
+
+    tot_in_flight = sum(in_flight_map.values()) if in_flight_map else 0
+
+    now_dt = datetime.fromtimestamp(now_ts)
+    time_str = now_dt.strftime("%Y-%m-%d %H:%M:%S") if width >= 65 else now_dt.strftime("%H:%M:%S")
+
+    sep = "=" * width
+    sub_sep = "-" * width
+
+    lines = []
+    lines.append(sep)
+
+    # Header line 1: Title & Time / Status Message
+    p_label = f" {CLR_YELLOW}[PAUSED]{CLR_RESET}" if paused else ""
+    title_left = f" {CLR_BOLD}{CLR_CYAN}agy-pool top{CLR_RESET} · v{VERSION}{p_label}"
+    if status_msg:
+        cand = f"{CLR_CYAN}{status_msg}{CLR_RESET}  {time_str} "
+        if _str_visible_width(title_left) + _str_visible_width(cand) <= width:
+            title_right = cand
+        elif _str_visible_width(title_left) + _str_visible_width(f"{status_msg} ") <= width:
+            title_right = f"{CLR_CYAN}{status_msg}{CLR_RESET} "
+        else:
+            title_right = f"{time_str} "
+    else:
+        title_right = f"{time_str} "
+
+    gap = width - _str_visible_width(title_left) - _str_visible_width(title_right)
+    if gap > 0:
+        lines.append(f"{title_left}{' ' * gap}{title_right}")
+    else:
+        lines.append(f"{title_left} {title_right}")
+
+    # Header line 2: Gateway / Strategy / In-Flight / Refresh Interval
+    if is_compact:
+        gw_short = f"{CLR_GREEN}RUNNING{CLR_RESET}" if is_running else f"{CLR_YELLOW}STOPPED{CLR_RESET}"
+        if width < 54:
+            h_parts = [
+                f"GW: {gw_short}",
+                f"Strat: {strategy[:6]}",
+                f"{interval:.1f}s",
+            ]
+        else:
+            h_parts = [
+                f"GW: {gw_short}",
+                f"Strat: {strategy[:6]}",
+                f"Flt: {tot_in_flight}",
+                f"Refresh: {interval:.1f}s",
+            ]
+        lines.append(" " + " | ".join(h_parts))
+    else:
+        h_parts = [
+            f"Gateway: {gw_tag}",
+            f"Strategy: {CLR_BOLD}{strategy}{CLR_RESET}{' ' * (11 - len(strategy))}",
+        ]
+        if tot_in_flight > 0:
+            h_parts.append(f"In-Flight: {CLR_BOLD}{CLR_YELLOW}{tot_in_flight}{CLR_RESET}")
+        else:
+            h_parts.append("In-Flight: 0")
+        h_parts.append(f"Refresh: {interval:.1f}s")
+        lines.append("  " + " | ".join(h_parts))
+    lines.append(sep)
+
+    if not accounts:
+        lines.append(f"  {CLR_YELLOW}No accounts in pool yet. Run 'agy-pool login' to add accounts.{CLR_RESET}")
+    else:
+        # Dynamic responsive layout engine
+        target_w = width - 1  # 1-char safe right margin
+        if width >= 90:
+            bar_blocks, quota_w, compact_quota = 8, 17, False
+            hdr_5h, hdr_w = "GEMINI 5-HOUR", "GEMINI WEEKLY"
+            status_w, hits_w, flt_w, acc_stat_gap = 13, 5, 3, 2
+        elif width >= 78:
+            bar_blocks, quota_w, compact_quota = 6, 15, False
+            hdr_5h, hdr_w = "GEMINI 5-HOUR", "GEMINI WEEKLY"
+            status_w, hits_w, flt_w, acc_stat_gap = 13, 5, 3, 2
+        elif width >= 60:
+            bar_blocks, quota_w, compact_quota = 4, 11, True
+            hdr_5h, hdr_w = "5H QUOTA", "WEEKLY"
+            status_w, hits_w, flt_w, acc_stat_gap = 13, 4, 2, 2
+        else:
+            bar_blocks, quota_w, compact_quota = 3, 10, True
+            hdr_5h, hdr_w = "5H", "WEEKLY"
+            status_w, hits_w, flt_w, acc_stat_gap = 8, 4, 0, 1
+
+        flt_col = (1 + flt_w) if flt_w > 0 else 0
+        base_fixed = 4 + acc_stat_gap + status_w + 1 + hits_w + flt_col + 1 + quota_w + 1 + quota_w
+        acc_w = max(8, target_w - base_fixed)
+        if acc_w > 24 and width >= 100:
+            extra = acc_w - 24
+            acc_w = 24
+            bar_blocks += min(4, extra // 2)
+            quota_w = bar_blocks + (7 if compact_quota else 9)
+            base_fixed = 4 + acc_stat_gap + status_w + 1 + hits_w + flt_col + 1 + quota_w + 1 + quota_w
+            acc_w = target_w - base_fixed
+
+        acc_stat_gap_str = " " * acc_stat_gap
+        flt_tag = "FLT" if flt_w >= 3 else "FL"
+        aligned_flt = _fit_term_string(flt_tag, flt_w, align="right")
+        flt_hdr = (aligned_flt + " ") if flt_w > 0 else ""
+        h_line = (
+            f" {_fit_term_string('#', 2, align='right')} "
+            f"{_fit_term_string('ACCOUNT', acc_w)}"
+            f"{acc_stat_gap_str}"
+            f"{_fit_term_string('STATUS', status_w)} "
+            f"{_fit_term_string('HITS', hits_w, align='right')} "
+            f"{flt_hdr}"
+            f"{_fit_term_string(hdr_5h, quota_w)} "
+            f"{_fit_term_string(hdr_w, quota_w)}"
+        )
+        lines.append(f"{CLR_BOLD}{h_line}{CLR_RESET}")
+        lines.append(sub_sep)
+
+        for i, acc in enumerate(accounts, start=1):
+            acc_id = acc.get("id", f"acc_{i}")
+            is_active = (acc_id == active_id)
+            q = acc.get("last_quota", {})
+            g5_frac, gw_frac = _display_quota_fractions(q)
+            flt = in_flight_map.get(acc_id, 0)
+
+            is_cooling = acc.get("rate_limited_until", 0) > now_ts
+            is_exhausted = any(fraction is not None and fraction <= 0.005 for fraction in (g5_frac, gw_frac))
+            status = acc.get("status")
+
+            if status_w >= 12:
+                if status == "validation_required":
+                    marker = f"{CLR_YELLOW}⚠ Verify{CLR_RESET}"
+                elif status == "auth_error":
+                    marker = f"{CLR_RED}✖ Auth{CLR_RESET}"
+                elif is_cooling:
+                    marker = f"{CLR_YELLOW}Cooldown{CLR_RESET}"
+                elif is_exhausted:
+                    marker = f"{CLR_DIM}Exhausted{CLR_RESET}"
+                elif flt > 0:
+                    marker = f"{CLR_BOLD}{CLR_CYAN}⚡ Running{CLR_RESET}"
+                elif is_active:
+                    marker = f"{CLR_GREEN}* Active{CLR_RESET}"
+                else:
+                    marker = f"{CLR_CYAN}Ready{CLR_RESET}"
+            else:
+                if status == "validation_required":
+                    marker = f"{CLR_YELLOW}Verify{CLR_RESET}"
+                elif status == "auth_error":
+                    marker = f"{CLR_RED}Auth{CLR_RESET}"
+                elif is_cooling:
+                    marker = f"{CLR_YELLOW}Cool{CLR_RESET}"
+                elif is_exhausted:
+                    marker = f"{CLR_DIM}Empty{CLR_RESET}"
+                elif flt > 0:
+                    marker = f"{CLR_BOLD}{CLR_CYAN}⚡ Run{CLR_RESET}"
+                elif is_active:
+                    marker = f"{CLR_GREEN}Active{CLR_RESET}"
+                else:
+                    marker = f"{CLR_CYAN}Ready{CLR_RESET}"
+
+            disp_name = display_account_name(acc, show_email=show_email)
+            name_cell = _fit_term_string(disp_name, acc_w)
+            status_cell = _fit_term_string(f"[{marker}]", status_w)
+
+            hits = acc.get("gen_count", acc.get("request_count", 0))
+            if hits_w >= 5:
+                hits_str = f"{hits:>5}" if hits < 100000 else f"{hits // 1000}k"
+            else:
+                hits_str = f"{hits:>4}" if hits < 10000 else f"{hits // 1000}k"
+            hits_cell = f"{hits_str:>{hits_w}}"
+
+            if flt_w > 0:
+                if flt > 0:
+                    flt_cell = f"{CLR_BOLD}{CLR_YELLOW}{flt:>{flt_w}}{CLR_RESET} "
+                else:
+                    flt_cell = f"{CLR_DIM}{flt:>{flt_w}}{CLR_RESET} "
+            else:
+                flt_cell = ""
+
+            if status in ("validation_required", "auth_error"):
+                block_label = " Block " if not compact_quota else " Blck"
+                block_pad = quota_w - 2 - bar_blocks - len(block_label)
+                pad_str = " " * max(0, block_pad)
+                g5_bar = f"{CLR_DIM}[{'░' * bar_blocks}]{block_label}{pad_str}{CLR_RESET}"
+                gw_bar = f"{CLR_DIM}[{'░' * bar_blocks}]{block_label}{pad_str}{CLR_RESET}"
+            else:
+                g5_bar = render_progress_bar(g5_frac, width=bar_blocks, compact=compact_quota)
+                gw_bar = render_progress_bar(gw_frac, width=bar_blocks, compact=compact_quota)
+
+            row = f" {i:>2} {name_cell}{acc_stat_gap_str}{status_cell} {hits_cell} {flt_cell}{g5_bar} {gw_bar}"
+            lines.append(row)
+
+    if not is_short:
+        lines.append(sub_sep)
+
+    # Telemetry block (Runway & Health) - only if screen height has room
+    if term_lines >= 18:
+        fc = simulate_quota_runway(pool, now=now_ts)
+        if fc.get("status") == "ok":
+            h_count = fc.get("healthy_count", 0)
+            tot_count = fc.get("total_accounts", 0)
+            cool_count = fc.get("cooling_count", 0)
+            pace = fc.get("target_pace", 0.0)
+            is_idle = fc.get("is_idle", False)
+            replenish = fc.get("replenish_rate_pct_hr", 0.0)
+            burn = fc.get("burn_rate_pct_hr", 0.0)
+            net = fc.get("net_rate_pct_hr", 0.0)
+            sim = fc.get("current_runway", {})
+            bench = fc.get("benchmark_runway", {})
+
+            health_str = f"{h_count}/{tot_count} Active"
+            if cool_count > 0:
+                health_str += f" ({cool_count} Cooling)"
+
+            sign = "+" if net >= 0 else ""
+            net_clr = CLR_GREEN if net >= 0 else CLR_YELLOW
+
+            if width < 76:
+                # Responsive compact telemetry (< 76 cols, never wraps)
+                lines.append(f" {CLR_BOLD}{CLR_CYAN}⚡ Quota Runway & Health:{CLR_RESET}")
+                pace_val = "Idle" if is_idle else f"{pace:.1f}/hr"
+                lines.append(f"  • Health & Pace:  {health_str} | {pace_val}")
+                if is_idle:
+                    lines.append(f"  • Capacity:       +{replenish:.1f}%/hr reload")
+                else:
+                    b_unit = "%" if width < 54 else "%/hr"
+                    lines.append(f"  • Burn/Reload:    ~{burn:.1f}{b_unit} | +{replenish:.1f}{b_unit} ({net_clr}{sign}{net:.1f}%{CLR_RESET})")
+
+                # 5h Runway compact
+                if is_idle:
+                    r5_tag = f"{CLR_GREEN}⚡ Sustainable{CLR_RESET}" if bench.get("is_sustainable_5h") else f"~{_format_duration_short(bench.get('first_stall_sec'))}"
+                else:
+                    if sim.get("is_sustainable_5h"):
+                        r5_tag = f"{CLR_GREEN}⚡ Sustainable{CLR_RESET}"
+                    elif sim.get("first_stall_sec") is not None:
+                        r5_tag = f"{CLR_YELLOW}~{_format_duration_short(sim['first_stall_sec'])}{CLR_RESET}"
+                    else:
+                        r5_tag = f"{CLR_GREEN}⚡ Sustainable{CLR_RESET}"
+                lines.append(f"  • 5-Hour Runway:  {r5_tag}")
+
+                # Weekly Runway compact
+                active_sim = bench if is_idle else sim
+                if active_sim.get("is_sustainable_weekly"):
+                    w_tag = f"{CLR_GREEN}⚡ Sustainable{CLR_RESET}"
+                elif active_sim.get("weekly_exhaust_sec") is not None:
+                    w_days = active_sim["weekly_exhaust_sec"] / 86400.0
+                    w_clr = CLR_YELLOW if w_days > 2.0 else CLR_RED
+                    w_tag = f"{w_clr}~{w_days:.1f}d{CLR_RESET}"
+                else:
+                    w_tag = f"{CLR_GREEN}⚡ Sustainable{CLR_RESET}"
+                lines.append(f"  • Weekly Runway:  {w_tag}")
+            else:
+                # Full standard telemetry (>= 75 cols)
+                if is_idle:
+                    pace_str = f"{CLR_DIM}Idle (0 gens/hr){CLR_RESET}"
+                    pace_line = f"  • Health & Pace:  {health_str} | {pace_str}"
+                    replenish_line = f"  • Capacity:       +{replenish:.1f}%/hr natural recovery across pool"
+                else:
+                    win_label = fc.get("telemetry", {}).get("window_used", "smoothed")
+                    pace_str = f"{CLR_BOLD}{pace:.1f} gens/hr{CLR_RESET} ({CLR_CYAN}{win_label}{CLR_RESET})"
+                    pace_line = f"  • Health & Pace:  {health_str} | {pace_str}"
+                    replenish_line = f"  • Burn/Reload:    ~{burn:.1f}%/hr burn | +{replenish:.1f}%/hr reload ({net_clr}{sign}{net:.1f}%/hr net{CLR_RESET})"
+
+                lines.append(f" {CLR_BOLD}{CLR_CYAN}⚡ Quota Runway & Endurance Forecast:{CLR_RESET}")
+                lines.append(pace_line)
+                lines.append(replenish_line)
+
+                # 5h Runway
+                if is_idle:
+                    r5_tag = f"{CLR_GREEN}⚡ Sustainable{CLR_RESET} (> 24h at standard pace)" if bench.get("is_sustainable_5h") else f"~{_format_duration_short(bench.get('first_stall_sec'))}"
+                else:
+                    if sim.get("is_sustainable_5h"):
+                        r5_tag = f"{CLR_GREEN}⚡ Sustainable{CLR_RESET} (Pool replenishes faster than burn)"
+                    elif sim.get("first_stall_sec") is not None:
+                        stall_str = _format_duration_short(sim["first_stall_sec"])
+                        cause_note = ""
+                        if sim.get("stall_duration_sec"):
+                            cause_note = f" (Dry pause: ~{_format_duration_short(sim['stall_duration_sec'])})"
+                        r5_tag = f"{CLR_YELLOW}~{stall_str} until stall{CLR_RESET}{cause_note}"
+                    else:
+                        r5_tag = f"{CLR_GREEN}⚡ Sustainable{CLR_RESET}"
+                lines.append(f"  • 5-Hour Runway:  {r5_tag}")
+
+                # Weekly Runway
+                active_sim = bench if is_idle else sim
+                if active_sim.get("is_sustainable_weekly"):
+                    w_tag = f"{CLR_GREEN}⚡ Sustainable{CLR_RESET} (> 7 Days remaining)"
+                elif active_sim.get("weekly_exhaust_sec") is not None:
+                    w_days = active_sim["weekly_exhaust_sec"] / 86400.0
+                    w_clr = CLR_YELLOW if w_days > 2.0 else CLR_RED
+                    w_tag = f"{w_clr}~{w_days:.1f} Days remaining{CLR_RESET}"
+                else:
+                    w_tag = f"{CLR_GREEN}⚡ Sustainable{CLR_RESET}"
+                w_label = "Weekly Budget: " if is_idle else "Weekly Runway: "
+                lines.append(f"  • {w_label} {w_tag}")
+
+    lines.append(sub_sep)
+    if width >= 80:
+        strat_btn = f"Strategy ({strategy})"
+        lines.append(f" {CLR_BOLD}[q]{CLR_RESET} Quit  {CLR_BOLD}[r]{CLR_RESET} Refresh  {CLR_BOLD}[s]{CLR_RESET} {strat_btn:<22}  {CLR_BOLD}[+/-]{CLR_RESET} {interval:.1f}s  {CLR_BOLD}[Space]{CLR_RESET} Pause")
+    elif width >= 62:
+        lines.append(f" {CLR_BOLD}[q]{CLR_RESET}Quit {CLR_BOLD}[r]{CLR_RESET}Refresh {CLR_BOLD}[s]{CLR_RESET}Strat({strategy[:6]}) {CLR_BOLD}[+/-]{CLR_RESET}{interval:.1f}s {CLR_BOLD}[Space]{CLR_RESET}Pause")
+    else:
+        lines.append(f" {CLR_BOLD}[q]{CLR_RESET}Quit {CLR_BOLD}[r]{CLR_RESET}Refresh {CLR_BOLD}[s]{CLR_RESET}Strat {CLR_BOLD}[+/-]{CLR_RESET}{interval:.1f}s {CLR_BOLD}[Space]{CLR_RESET}")
+    lines.append(sep)
+
+    return "\n".join(lines)
+
+
+def run_top(interval=None, show_email=None, once=False):
+    """Interactive real-time quota & activity monitor dashboard."""
+    pool_data = load_pool()
+    if interval is None:
+        interval = float(pool_data.get("top_interval", 2.0))
+    interval = max(0.5, min(60.0, float(interval)))
+    paused = False
+    status_msg = None
+    status_msg_until = 0.0
+
+    if once or not sys.stdin.isatty():
+        in_flight_map = {}
+        daemon_info = get_daemon_info()
+        if daemon_info and is_port_listening():
+            try:
+                req = urllib.request.Request(f"http://127.0.0.1:{DEFAULT_PORT}/_agy_pool/stats")
+                with urllib.request.urlopen(req, timeout=0.2) as resp:
+                    in_flight_map = json.loads(resp.read().decode()).get("in_flight", {})
+            except Exception:
+                pass
+        frame = render_top_frame(
+            pool_data,
+            interval=interval,
+            paused=paused,
+            show_email=show_email,
+            in_flight_map=in_flight_map
+        )
+        print(frame)
+        return
+
+    # Interactive mode
+    old_term = None
+    fd = sys.stdin.fileno()
+    if HAS_TERMIOS:
+        try:
+            old_term = termios.tcgetattr(fd)
+            tty.setcbreak(fd)
+        except Exception:
+            old_term = None
+
+    # Handle window resize gracefully
+    old_winch = None
+    resized = [False]
+    if hasattr(signal, "SIGWINCH"):
+        try:
+            def _handle_winch(signum, frame_obj):
+                resized[0] = True
+            old_winch = signal.signal(signal.SIGWINCH, _handle_winch)
+        except Exception:
+            pass
+
+    # Hide cursor and clear screen once
+    sys.stdout.write(f"{ESC_CURSOR_HIDE}{ESC_CLEAR_SCREEN}{ESC_CURSOR_HOME}")
+    sys.stdout.flush()
+
+    try:
+        while True:
+            now = time.time()
+            pool = load_pool()
+            in_flight_map = {}
+            daemon_info = get_daemon_info()
+            if daemon_info and is_port_listening():
+                try:
+                    req = urllib.request.Request(f"http://127.0.0.1:{DEFAULT_PORT}/_agy_pool/stats")
+                    with urllib.request.urlopen(req, timeout=0.15) as resp:
+                        in_flight_map = json.loads(resp.read().decode()).get("in_flight", {})
+                except Exception:
+                    pass
+
+            active_msg = status_msg if time.time() < status_msg_until else None
+
+            frame = render_top_frame(
+                pool,
+                interval=interval,
+                paused=paused,
+                show_email=show_email,
+                in_flight_map=in_flight_map,
+                now_ts=now,
+                status_msg=active_msg
+            )
+
+            # Move cursor home and write frame cleanly, clearing to end of line to wipe any ghost chars
+            interactive_frame = "\n".join(f"{line}{ESC_CLEAR_LINE}" for line in frame.split("\n"))
+            sys.stdout.write(f"{ESC_CURSOR_HOME}{interactive_frame}{ESC_CLEAR_DOWN}")
+            sys.stdout.flush()
+
+            wait_target = now + (3600.0 if paused else interval)
+            while time.time() < wait_target:
+                if resized[0]:
+                    resized[0] = False
+                    sys.stdout.write(f"{ESC_CLEAR_SCREEN}{ESC_CURSOR_HOME}")
+                    sys.stdout.flush()
+                    break
+                if status_msg and time.time() >= status_msg_until:
+                    status_msg = None
+                    break
+                timeout = min(0.1, max(0.01, wait_target - time.time()))
+                r, _, _ = select.select([sys.stdin], [], [], timeout)
+                if r:
+                    ch = sys.stdin.read(1)
+                    if ch in ('q', 'Q', '\x03', '\x1b'):
+                        return
+                    elif ch in ('r', 'R'):
+                        for acc in pool.get("accounts", []):
+                            trigger_background_quota_refresh(acc)
+                        status_msg = "Syncing quotas with Google..."
+                        status_msg_until = time.time() + 2.0
+                        break
+                    elif ch in ('s', 'S'):
+                        current_strat = pool.get("strategy", "max_quota")
+                        order = ["max_quota", "least_used", "round_robin"]
+                        next_strat = order[(order.index(current_strat) + 1) % len(order)] if current_strat in order else "max_quota"
+                        def update(p):
+                            p["strategy"] = next_strat
+                        pool_transaction(update)
+                        status_msg = f"Strategy: {next_strat} (saved)"
+                        status_msg_until = time.time() + 1.5
+                        break
+                    elif ch in ('+', '='):
+                        interval = min(10.0, round(interval + 0.5, 1))
+                        def update(p):
+                            p["top_interval"] = interval
+                        pool_transaction(update)
+                        status_msg = f"Interval: {interval:.1f}s (saved)"
+                        status_msg_until = time.time() + 1.5
+                        break
+                    elif ch in ('-', '_'):
+                        interval = max(0.5, round(interval - 0.5, 1))
+                        def update(p):
+                            p["top_interval"] = interval
+                        pool_transaction(update)
+                        status_msg = f"Interval: {interval:.1f}s (saved)"
+                        status_msg_until = time.time() + 1.5
+                        break
+                    elif ch == ' ':
+                        paused = not paused
+                        status_msg = "Paused" if paused else "Resumed"
+                        status_msg_until = time.time() + 1.5
+                        break
+
+    except (KeyboardInterrupt, EOFError):
+        pass
+    finally:
+        if hasattr(signal, "SIGWINCH") and old_winch is not None:
+            try:
+                signal.signal(signal.SIGWINCH, old_winch)
+            except Exception:
+                pass
+        if HAS_TERMIOS and old_term is not None:
+            try:
+                termios.tcsetattr(fd, termios.TCSADRAIN, old_term)
+            except Exception:
+                pass
+        sys.stdout.write(f"{ESC_CURSOR_SHOW}\n")
+        sys.stdout.flush()
+
+
 class SmartProxyHandler(http.server.BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
@@ -3329,9 +3936,39 @@ class SmartProxyHandler(http.server.BaseHTTPRequestHandler):
                 stored["error_count"] = stored.get("error_count", 0) + 1
         pool_transaction(update)
 
+    def _handle_internal_api(self, path):
+        self.close_connection = True
+        if path in ("/_agy_pool/stats", "/_agy_pool/status", "/_agy_pool/health"):
+            data = {
+                "status": "ok",
+                "version": VERSION,
+                "pid": os.getpid(),
+                "in_flight": get_all_in_flight_counts(),
+                "time": time.time(),
+            }
+            body = json.dumps(data).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Connection", "close")
+            self.end_headers()
+            try:
+                self.wfile.write(body)
+                self.wfile.flush()
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+        else:
+            try:
+                self.send_error(404, "Not Found")
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+
     def handle_proxy(self):
         parsed = urllib.parse.urlsplit(self.path)
         path = urllib.parse.urlunsplit(("", "", parsed.path or "/", parsed.query, ""))
+        if path.startswith("/_agy_pool/"):
+            self._handle_internal_api(path)
+            return
         try:
             body = self._read_request_body()
         except (ValueError, OSError) as e:
@@ -3898,6 +4535,8 @@ def main():
     # list / quota / status
     list_p = subparsers.add_parser("list", aliases=["ls", "quota"], help="List accounts and display quota dashboard")
     list_p.add_argument("target", nargs="?", default=None, help="Optional account index, name, or email")
+    list_p.add_argument("-w", "--watch", action="store_true", help="Launch interactive real-time dashboard (same as 'agy-pool top')")
+    list_p.add_argument("-i", "--interval", type=float, default=None, help="Refresh interval in seconds when used with -w (default: from config or 2.0)")
     list_p.add_argument("--show-email", dest="show_email", action="store_true", default=None, help="Display real email addresses instead of masking")
     list_p.add_argument("--hide-email", dest="show_email", action="store_false", help="Hide real email addresses (mask with friendly names/aliases)")
     # remove
@@ -3936,12 +4575,20 @@ def main():
     subparsers.add_parser("stop", help="Stop background load balancer proxy daemon")
     subparsers.add_parser("restart", help="Restart background load balancer proxy daemon")
     stat_p = subparsers.add_parser("status", help="Check status of proxy daemon and pool")
+    stat_p.add_argument("-w", "--watch", action="store_true", help="Launch interactive real-time dashboard (same as 'agy-pool top')")
+    stat_p.add_argument("-i", "--interval", type=float, default=None, help="Refresh interval in seconds when used with -w (default: from config or 2.0)")
     stat_p.add_argument("--show-email", dest="show_email", action="store_true", default=None, help="Display real email addresses instead of masking")
     stat_p.add_argument("--hide-email", dest="show_email", action="store_false", help="Hide real email addresses (mask with friendly names/aliases)")
     # forecast / runway
     fore_p = subparsers.add_parser("forecast", aliases=["runway", "predict"], help="Predict quota endurance and runway based on usage and staggered resets")
     fore_p.add_argument("--pace", type=float, default=None, help="Simulate a custom burn rate in generations per hour (e.g. --pace 30)")
     fore_p.add_argument("--json", action="store_true", help="Output runway forecast in structured JSON format")
+    # top / watch / monitor
+    top_p = subparsers.add_parser("top", aliases=["watch", "monitor"], help="Interactive real-time quota & activity monitor dashboard")
+    top_p.add_argument("-i", "--interval", type=float, default=None, help="Refresh interval in seconds (default: from config or 2.0)")
+    top_p.add_argument("--once", action="store_true", help="Render single frame and exit (non-interactive)")
+    top_p.add_argument("--show-email", dest="show_email", action="store_true", default=None, help="Display real email addresses")
+    top_p.add_argument("--hide-email", dest="show_email", action="store_false", help="Hide real email addresses")
     # config
     cfg_p = subparsers.add_parser("config", help="View or update pool configuration settings (e.g. show_email, strategy)")
     cfg_p.add_argument("key", nargs="?", default=None, help="Configuration key (show_email, strategy)")
@@ -3964,9 +4611,14 @@ def main():
     elif cmd == "import-current":
         import_current()
     elif cmd in ["list", "ls", "quota"]:
-        list_accounts(getattr(args, "target", None), show_email=getattr(args, "show_email", None))
+        if getattr(args, "watch", False):
+            run_top(interval=args.interval, show_email=getattr(args, "show_email", None))
+        else:
+            list_accounts(getattr(args, "target", None), show_email=getattr(args, "show_email", None))
     elif cmd in ["forecast", "runway", "predict"]:
         show_forecast(pace=args.pace, json_output=args.json)
+    elif cmd in ["top", "watch", "monitor"]:
+        run_top(interval=args.interval, show_email=getattr(args, "show_email", None), once=args.once)
     elif cmd in ["remove", "rm"]:
         remove_account(args.target)
     elif cmd in ["rename", "alias", "name"]:
@@ -3990,16 +4642,19 @@ def main():
         time.sleep(1)
         start_proxy_daemon(foreground=False)
     elif cmd == "status":
-        info = get_daemon_info()
-        if info and is_port_listening():
-            ver_note = f" [v{info['version']}]" if info.get("version") else ""
-            if is_daemon_outdated():
-                print(f"{CLR_YELLOW}⚠ Gateway Proxy is RUNNING (PID: {info['pid']}{ver_note}, Outdated Code). Run 'agy-pool restart' to reload.{CLR_RESET}")
-            else:
-                print(f"{CLR_GREEN}✓ Gateway Proxy is RUNNING (PID: {info['pid']}{ver_note}) on http://127.0.0.1:{DEFAULT_PORT}{CLR_RESET}")
+        if getattr(args, "watch", False):
+            run_top(interval=args.interval, show_email=getattr(args, "show_email", None))
         else:
-            print(f"{CLR_YELLOW}○ Gateway Proxy is STOPPED{CLR_RESET}")
-        list_accounts(show_email=getattr(args, "show_email", None))
+            info = get_daemon_info()
+            if info and is_port_listening():
+                ver_note = f" [v{info['version']}]" if info.get("version") else ""
+                if is_daemon_outdated():
+                    print(f"{CLR_YELLOW}⚠ Gateway Proxy is RUNNING (PID: {info['pid']}{ver_note}, Outdated Code). Run 'agy-pool restart' to reload.{CLR_RESET}")
+                else:
+                    print(f"{CLR_GREEN}✓ Gateway Proxy is RUNNING (PID: {info['pid']}{ver_note}) on http://127.0.0.1:{DEFAULT_PORT}{CLR_RESET}")
+            else:
+                print(f"{CLR_YELLOW}○ Gateway Proxy is STOPPED{CLR_RESET}")
+            list_accounts(show_email=getattr(args, "show_email", None))
     elif cmd == "config":
         manage_config(args.key, args.value)
     elif cmd == "version":

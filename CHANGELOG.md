@@ -5,6 +5,41 @@ All notable changes to the `agy-pool` project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.0-beta.5] - 2026-09-19
+
+### Added
+- **Interactive Real-Time TUI Dashboard (`agy-pool top`)**:
+  - Implemented a zero-dependency, live-updating terminal dashboard monitor (aliases: `watch`, `monitor`).
+  - Flicker-free ANSI frame rendering with cursor management, clean screen updates, and POSIX terminal state restoration.
+  - **True Dynamic Responsive Layout Engine (50 ~ 120 Columns)**:
+    - Continuously scales column widths to terminal width (`target = width - 1`) leaving exactly 1 character safe margin, eliminating right-side empty space while ensuring the Weekly Quota percentage (`%`) is never cut off or wrapped.
+    - Upgraded `STATUS` column to width 13 for widths $\ge 60$, fully accommodating wide emoji `[⚡ Running]` (12 visible chars) without truncation.
+    - Expanded `ACCOUNT` and `STATUS` separation to 2 spaces (`  `) for clean breathing room.
+    - Dynamic quota progress bar tiers (8 blocks $\ge 90$ cols, 6 blocks $\ge 78$ cols, 4 blocks $\ge 60$ cols) with integer/float percentage precision and account name absorption.
+  - Accurate CJK / East Asian character display width calculation (`unicodedata.east_asian_width`) ensuring flawless vertical alignment for Chinese, Japanese, and Korean account names.
+  - Real-time in-flight request tracking and active running concurrency indicators per account.
+  - Interactive hotkey controls: `q`/`Esc` to quit cleanly, `r` to trigger background quota refresh, `s` to live-cycle load balancing strategy (`max_quota` -> `least_used` -> `round_robin`), `+`/`-` to adjust refresh intervals, and `Space` to pause/resume.
+  - Added lightweight internal gateway metrics & health endpoint (`/_agy_pool/stats`) for microsecond-latency in-memory telemetry inspection.
+- **Refresh Interval Preference Persistence & Tactical Feedback**:
+  - Automatically remembers and persists user-adjusted refresh intervals (`top_interval`) across sessions upon pressing `+` / `-`.
+  - Added CLI configuration support via `agy-pool config top_interval <sec>`.
+  - Added non-intrusive, timed visual feedback alerts in the dashboard header for interactive hotkeys (`Interval saved`, `Strategy switched`, `Syncing quotas`).
+  - Added `SIGWINCH` signal handling for instantaneous zero-lag re-rendering upon terminal or phone orientation resizing.
+- **Unified Command Experience (`agy-pool status -w` & In-Flight Awareness)**:
+  - Integrated the live watch dashboard directly into `status` and `quota` via `-w` / `--watch` flags (e.g. `agy-pool status -w`).
+  - Added live `[⚡ Running (N)]` in-flight concurrency tags to static `list` / `status` / `quota` output.
+  - Added subtle CLI navigation tip on static dashboards linking to the live dashboard.
+
+### Fixed
+- **Strategy Hotkey Button Formatting**:
+  - Padded column width outside parentheses (`Strategy (max_quota)  `), eliminating awkward trailing spaces inside parentheses.
+- **Missing Background Quota Trigger on Manual Refresh**:
+  - Implemented `trigger_background_quota_refresh()` daemon thread helper, fixing a `NameError` crash when pressing `r` in interactive dashboard mode.
+- **ANSI Truncation & Color Leak Elimination**:
+  - Rewrote `_fit_term_string()` to tokenize ANSI escape sequences vs printable characters, preventing color code truncation, premature clipping, and trailing color leaks.
+- **Progress Bar N/A Alignment Calibration**:
+  - Aligned `render_progress_bar()` `None` fraction width with valid percentage bars to eliminate table header drift.
+
 ## [0.1.0-beta.4] - 2026-09-19
 
 ### Fixed

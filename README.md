@@ -1,6 +1,6 @@
 # agy-pool: Antigravity Multi-Account Quota Pool & Intelligent Load Balancer Suite
 
-[![Version](https://img.shields.io/badge/version-0.1.0--beta.4-blue.svg)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-0.1.0--beta.5-blue.svg)](CHANGELOG.md)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Platform](https://img.shields.io/badge/platform-Termux%20%7C%20Linux%20%7C%20macOS-green.svg)](#)
 [![Python: 3.8+](https://img.shields.io/badge/python-3.8+-blue.svg)](#)
@@ -59,7 +59,8 @@ The installer validates Python 3, sets up symlinks (`agy-pool`, `agy-raw`), conf
 
 | Command | Description |
 | :--- | :--- |
-| `agy-pool status` | Show gateway daemon status, active account, and cached quotas (`--show-email`) |
+| `agy-pool status [-w]` | Show daemon status & quotas; `-w` / `--watch` launches live dashboard |
+| `agy-pool top` | Interactive real-time TUI dashboard with live in-flight & quota meters (`watch`) |
 | `agy-pool quota` | Probe and render visual quota bars and reset countdowns (`alias: list`) |
 | `agy-pool config` | View or toggle pool settings (e.g. `agy-pool config show_email true/false`) |
 | `agy-pool login` | Authenticate and add a new Google account via system browser |
