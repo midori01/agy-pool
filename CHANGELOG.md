@@ -5,6 +5,28 @@ All notable changes to the `agy-pool` project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.0-beta.3] - 2026-09-19
+
+### Fixed
+- **Telemetry Micro-Burst Damping & Multi-Window Rate Smoothing**:
+  - Resolved runaway forecast collapse where temporary 15-minute coding bursts (e.g. 92 calls in 15m) were linearly extrapolated across 168 hours of continuous 24/7 non-stop usage.
+  - Implemented multi-window blended moving average with micro-burst damping ($n_{60} \ge 10$ blends 50% 1h rate, 30% clamped burst rate, and 20% 4h rate) to prevent wild oscillation.
+  - Expanded rolling generation telemetry ring buffer from 100 to 1000 events (`TELEMETRY_CAP = 1000`), eliminating historical truncation under intensive tool bursts.
+- **Empirically Calibrated Per-Hit Quota Consumption Constants**:
+  - Calibrated `DEFAULT_FRACTION_PER_HIT_WEEKLY` from 0.0015 (0.15%) to 0.00035 (~0.035% per call), matching actual Google Cloud Code weekly account limits (~2,850 calls/week) and eliminating 4.3x pessimistic distortion.
+  - Calibrated `DEFAULT_FRACTION_PER_HIT_5H` from 0.0075 to 0.0050 (~0.50% per call, ~200 calls/5h window).
+- **Realistic Active Coding Duty-Cycle Simulation**:
+  - Differentiated burst endurance (testing whether the pool can sustain the active sprint) from multi-day weekly stamina.
+  - Modeled natural human/agent coding workflows (8 hours active work/day duty cycle) for 7-day weekly projections, preventing unrealistic 24/7 continuous burn panic while retaining full continuous simulation for explicit `--pace` benchmarks.
+- **Universal Multi-Environment Installer Hardening (`install.sh`)**:
+  - Eliminated script aborts caused by `set -e` on transient Termux mirror warnings or interactive dpkg prompts.
+  - Added autonomous non-interactive dependency resolution across Termux (`pkg` / `apt-get`), Debian/Ubuntu (`apt-get`), Arch (`pacman`), Fedora (`dnf`), Alpine (`apk`), openSUSE (`zypper`), and macOS (`brew`).
+  - Added verification for `ca-certificates` and Python SSL certificate verification to prevent Google OAuth HTTPS validation failures on fresh installations.
+  - Added PATH environment detection and auto-configuration across both `~/.bashrc` and `~/.zshrc`.
+  - Added end-to-end post-install binary execution verification.
+- **Automated Test Coverage**:
+  - Expanded test suite to 99 automated tests with 100% pass rate.
+
 ## [0.1.0-beta.2] - 2026-09-19
 
 ### Added

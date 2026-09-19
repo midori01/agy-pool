@@ -2422,11 +2422,11 @@ class AgyPoolTest(unittest.TestCase):
     def test_record_generation_telemetry_window_and_cap(self):
         pool = {}
         now = 50000.0
-        for i in range(105):
-            ts = now - 20000 + i * 200
+        for i in range(1100):
+            ts = now - 20000 + i * 15
             agy_pool.record_generation_telemetry(pool, f"acc_{i}", now=ts)
         events = pool.get("generation_events", [])
-        self.assertLessEqual(len(events), 100)
+        self.assertLessEqual(len(events), 1000)
         latest_ts = max(e["ts"] for e in events)
         earliest_ts = min(e["ts"] for e in events)
         self.assertGreaterEqual(earliest_ts, latest_ts - 14400)
@@ -2448,8 +2448,8 @@ class AgyPoolTest(unittest.TestCase):
         self.assertTrue(res_light["current_runway"]["is_sustainable_weekly"])
         self.assertIsNone(res_light["current_runway"]["first_stall_sec"])
 
-        # 2. At 15.0 gens/hr: 5h is sustainable, but weekly exhausts on day 5 (~120h)
-        res_med = agy_pool.simulate_quota_runway(pool, pace_gens_per_hour=15.0, now=now)
+        # 2. At 65.0 gens/hr: 5h is sustainable (net positive reload), but weekly exhausts at ~118h
+        res_med = agy_pool.simulate_quota_runway(pool, pace_gens_per_hour=65.0, now=now)
         self.assertEqual(res_med["status"], "ok")
         self.assertEqual(res_med["healthy_count"], 3)
         self.assertEqual(res_med["replenish_rate_pct_hr"], 60.0)
@@ -2471,7 +2471,7 @@ class AgyPoolTest(unittest.TestCase):
         self.assertFalse(res["current_runway"]["is_sustainable_5h"])
         stall_sec = res["current_runway"]["first_stall_sec"]
         self.assertIsNotNone(stall_sec)
-        self.assertTrue(1200 <= stall_sec <= 2400)
+        self.assertTrue(1800 <= stall_sec <= 3600)
         self.assertEqual(res["current_runway"]["first_stall_cause"], "5h")
         self.assertGreater(res["current_runway"]["stall_duration_sec"], 0)
 
@@ -2534,6 +2534,15 @@ class AgyPoolTest(unittest.TestCase):
         self.assertTrue(data["is_custom_pace"])
         self.assertIn("replenish_rate_pct_hr", data)
         self.assertIn("current_runway", data)
+
+        # Test show_forecast with pace=0.0 (custom pace, not idle fallback)
+        buf_zero = io.StringIO()
+        with mock.patch("sys.stdout", buf_zero):
+            agy_pool.show_forecast(pace=0.0, json_output=True)
+        data_zero = json.loads(buf_zero.getvalue())
+        self.assertEqual(data_zero["target_pace"], 0.0)
+        self.assertTrue(data_zero["is_custom_pace"])
+        self.assertFalse(data_zero["is_idle"])
 
         # Test show_forecast formatted text
         buf_txt = io.StringIO()
@@ -2618,6 +2627,43 @@ class AgyPoolTest(unittest.TestCase):
             self.assertTrue(changed)
             self.assertEqual(pool_state["accounts"][0]["name"], "From JWT")
             self.assertEqual(pool_state["accounts"][1]["name"], "From API")
+
+    def test_burn_rate_multi_window_smoothing_and_damping(self):
+        now = 1000000.0
+        # 100 events in 15 minutes (burst of 400 gens/hr)
+        events = [{"ts": now - 100 - i * 5, "id": "acc_1"} for i in range(100)]
+        pool = {"generation_events": events}
+        rate = agy_pool.get_burn_rate(pool, now=now)
+        self.assertEqual(rate["window_used"], "smoothed")
+        self.assertEqual(rate["gens_last_15m"], 100)
+        self.assertEqual(rate["gens_last_1h"], 100)
+        self.assertEqual(rate["burst_rate_15m"], 400.0)
+        self.assertEqual(rate["sustained_rate_1h"], 100.0)
+        self.assertEqual(rate["sustained_rate_4h"], 25.0)
+        # Expected smoothed: 0.50*100 + 0.30*min(400, 200) + 0.20*25 = 50 + 60 + 5 = 115.0
+        self.assertEqual(rate["gens_per_hour"], 115.0)
+        self.assertEqual(rate["daily_pace"], 38.3)
+
+    def test_simulate_quota_runway_telemetry_duty_cycle(self):
+        now = 1000000.0
+        # Create pool with 3 accounts, 100 generation events in recent window
+        acc1 = account("acc_1")
+        acc1["last_quota"] = {"gemini_5h": {"fraction": 1.0, "reset_time": now + 18000}, "gemini_weekly": {"fraction": 0.8, "reset_time": now + 500000}}
+        acc2 = account("acc_2")
+        acc2["last_quota"] = {"gemini_5h": {"fraction": 1.0, "reset_time": now + 18000}, "gemini_weekly": {"fraction": 0.8, "reset_time": now + 500000}}
+        acc3 = account("acc_3")
+        acc3["last_quota"] = {"gemini_5h": {"fraction": 1.0, "reset_time": now + 18000}, "gemini_weekly": {"fraction": 0.8, "reset_time": now + 500000}}
+
+        events = [{"ts": now - 100 - i * 5, "id": "acc_1"} for i in range(100)]
+        pool = {"accounts": [acc1, acc2, acc3], "generation_events": events, "strategy": "max_quota"}
+
+        res = agy_pool.simulate_quota_runway(pool, now=now)
+        self.assertEqual(res["status"], "ok")
+        self.assertEqual(res["target_pace"], 115.0)
+        self.assertEqual(res["target_weekly_pace"], 38.3)
+        self.assertFalse(res["is_custom_pace"])
+        self.assertFalse(res["is_idle"])
+        self.assertTrue(res["current_runway"]["is_sustainable_weekly"])
 
 
 if __name__ == "__main__":
