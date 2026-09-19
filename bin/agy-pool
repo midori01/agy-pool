@@ -743,10 +743,13 @@ def format_remaining_time(iso_reset_time):
     if not iso_reset_time:
         return "N/A"
     try:
-        clean_time = iso_reset_time.replace("Z", "+00:00")
-        target_dt = datetime.fromisoformat(clean_time)
-        now_dt = datetime.now(timezone.utc)
-        diff_sec = int((target_dt - now_dt).total_seconds())
+        if isinstance(iso_reset_time, (int, float)):
+            diff_sec = int(float(iso_reset_time) - time.time())
+        else:
+            clean_time = str(iso_reset_time).replace("Z", "+00:00")
+            target_dt = datetime.fromisoformat(clean_time)
+            now_dt = datetime.now(timezone.utc)
+            diff_sec = int((target_dt - now_dt).total_seconds())
         if diff_sec <= 0:
             return "Ready"
         days, rem = divmod(diff_sec, 86400)
@@ -758,7 +761,7 @@ def format_remaining_time(iso_reset_time):
             return f"in {hours}h {minutes}m"
         return f"in {minutes}m"
     except Exception:
-        return iso_reset_time[:16]
+        return str(iso_reset_time)[:16]
 
 
 def render_progress_bar(fraction, width=10):
@@ -1247,6 +1250,7 @@ def list_accounts(target=None, show_email=None):
     print(f" {CLR_GREEN}[* Active]{CLR_RESET} {CLR_DIM}CLI Base Token{CLR_RESET}    {CLR_CYAN}[Ready]{CLR_RESET} {CLR_DIM}In Rotation Pool{CLR_RESET}")
     print(f" {CLR_YELLOW}[Cooldown]{CLR_RESET} {CLR_DIM}Rate Limited{CLR_RESET}      {CLR_DIM}[Exhausted] Quota Depleted{CLR_RESET}")
     print(f" Strategy: {CLR_BOLD}{pool.get('strategy', 'max_quota')}{CLR_RESET} | Gateway Proxy: {gateway_status}")
+    print_runway_summary(pool, now=now_ts)
     print(sep + "\n")
 
 
@@ -2381,6 +2385,511 @@ def reserve_round_robin_account(now=None):
     return candidates[0] if candidates else None
 
 
+# ----------------- Quota Runway & Endurance Predictor -----------------
+DEFAULT_FRACTION_PER_HIT_5H = 0.0075      # ~0.75% of 5h quota (~133 generations per 5h window)
+DEFAULT_FRACTION_PER_HIT_WEEKLY = 0.0015  # ~0.15% of weekly quota (~667 generations per week)
+BENCHMARK_PACE_GENS_PER_HOUR = 20.0       # Standard active pair-programming baseline (1 gen every 3 mins)
+
+
+def record_generation_telemetry(pool, account_id, now=None):
+    """Record timestamped inference telemetry in a bounded rolling 4-hour window."""
+    if now is None:
+        now = time.time()
+    now_ts = int(now)
+    events = pool.setdefault("generation_events", [])
+    events.append({"ts": now_ts, "id": account_id})
+    cutoff = now_ts - 14400
+    pool["generation_events"] = [e for e in events if isinstance(e, dict) and e.get("ts", 0) >= cutoff][-100:]
+
+
+def get_burn_rate(pool, now=None):
+    """
+    Calculate recent inference frequency and quota burn rate across rolling windows.
+    Returns generation counts over 15m, 1h, 4h, and inferred generations per hour.
+    """
+    if now is None:
+        now = time.time()
+    now_ts = float(now)
+    events = pool.get("generation_events", []) if isinstance(pool, dict) else []
+    valid_ts = []
+    for e in events:
+        if isinstance(e, dict) and "ts" in e:
+            try:
+                valid_ts.append(float(e["ts"]))
+            except (TypeError, ValueError):
+                pass
+        elif isinstance(e, (int, float)):
+            valid_ts.append(float(e))
+
+    n15 = sum(1 for ts in valid_ts if now_ts - ts <= 900)
+    n60 = sum(1 for ts in valid_ts if now_ts - ts <= 3600)
+    n240 = sum(1 for ts in valid_ts if now_ts - ts <= 14400)
+
+    if n15 >= 2:
+        rate = n15 * 4.0
+        window = "15m"
+    elif n60 >= 1:
+        rate = float(n60)
+        window = "1h"
+    elif n240 >= 1:
+        rate = n240 / 4.0
+        window = "4h"
+    else:
+        rate = 0.0
+        window = "idle"
+
+    return {
+        "gens_last_15m": n15,
+        "gens_last_1h": n60,
+        "gens_last_4h": n240,
+        "gens_per_hour": rate,
+        "is_idle": rate == 0.0,
+        "window_used": window,
+    }
+
+
+def _run_single_simulation(sim_accs, pace, strategy, now, sim_hours=168):
+    """
+    Simulates chronological quota depletion and staggered reset replenishment.
+    Models minute-by-minute account selection and capacity recovery.
+    """
+    if pace <= 0:
+        return {
+            "first_stall_sec": None,
+            "first_stall_cause": None,
+            "stall_duration_sec": None,
+            "first_empty_acc_id": None,
+            "first_empty_sec": None,
+            "weekly_exhaust_sec": None,
+            "is_sustainable_5h": True,
+            "is_sustainable_weekly": True,
+        }
+
+    accs = [{
+        "id": a["id"],
+        "display_name": a["display_name"],
+        "is_restricted": a["is_restricted"],
+        "cooldown_until": a["cooldown_until"],
+        "q5": a["q5"],
+        "qw": a["qw"],
+        "reset5_ts": a["reset5_ts"],
+        "resetw_ts": a["resetw_ts"],
+        "sim_hits": a["sim_hits"],
+    } for a in sim_accs]
+
+    rr_cursor = 0
+    first_empty_acc_id = None
+    first_empty_sec = None
+    first_stall_sec = None
+    first_stall_cause = None
+    stall_duration_sec = None
+    weekly_exhaust_sec = None
+
+    t = now
+    end_t = now + sim_hours * 3600
+
+    cost_5h = DEFAULT_FRACTION_PER_HIT_5H
+    cost_qw = DEFAULT_FRACTION_PER_HIT_WEEKLY
+
+    while t < end_t:
+        elapsed = t - now
+        if elapsed < 12 * 3600:
+            dt = 60.0
+        elif elapsed < 48 * 3600:
+            dt = 300.0
+        else:
+            dt = 1800.0
+
+        t += dt
+
+        # Apply quota resets
+        for a in accs:
+            if not a["is_restricted"]:
+                if t >= a["reset5_ts"]:
+                    a["q5"] = 1.0
+                    while a["reset5_ts"] <= t:
+                        a["reset5_ts"] += WINDOW_5H_SECS
+                if t >= a["resetw_ts"]:
+                    a["qw"] = 1.0
+                    while a["resetw_ts"] <= t:
+                        a["resetw_ts"] += WINDOW_7D_SECS
+
+        demand_gens = pace * (dt / 3600.0)
+        demand_q5 = demand_gens * cost_5h
+        demand_qw = demand_gens * cost_qw
+
+        eligible = [
+            a for a in accs
+            if not a["is_restricted"]
+            and t >= a["cooldown_until"]
+            and a["q5"] > 0.005
+            and a["qw"] > 0.005
+        ]
+
+        if not eligible:
+            if first_stall_sec is None:
+                first_stall_sec = t - now
+                weekly_dead = all(a["qw"] <= 0.005 for a in accs if not a["is_restricted"])
+                cooling_dead = all(t < a["cooldown_until"] for a in accs if not a["is_restricted"])
+                if weekly_dead:
+                    first_stall_cause = "weekly"
+                elif cooling_dead:
+                    first_stall_cause = "cooldown"
+                else:
+                    first_stall_cause = "5h"
+
+                relief_candidates = []
+                for a in accs:
+                    if not a["is_restricted"]:
+                        relief_candidates.append(a["reset5_ts"])
+                        relief_candidates.append(a["resetw_ts"])
+                        if a["cooldown_until"] > t:
+                            relief_candidates.append(a["cooldown_until"])
+                if relief_candidates:
+                    stall_duration_sec = max(0.0, min(relief_candidates) - t)
+
+            if all(a["qw"] <= 0.005 for a in accs if not a["is_restricted"]):
+                if weekly_exhaust_sec is None:
+                    weekly_exhaust_sec = t - now
+                break
+
+            if elapsed >= 48 * 3600:
+                break
+            continue
+
+        if strategy == "round_robin":
+            selected = eligible[rr_cursor % len(eligible)]
+            rr_cursor = (rr_cursor + 1) % len(eligible)
+        elif strategy == "least_used":
+            selected = min(eligible, key=lambda a: a["sim_hits"])
+        else:  # max_quota
+            selected = max(eligible, key=lambda a: (a["q5"], a["qw"], -a["sim_hits"]))
+
+        selected["q5"] = max(0.0, selected["q5"] - demand_q5)
+        selected["qw"] = max(0.0, selected["qw"] - demand_qw)
+        selected["sim_hits"] += demand_gens
+
+        if selected["q5"] <= 0.005 and first_empty_sec is None:
+            first_empty_sec = t - now
+            first_empty_acc_id = selected["id"]
+        if selected["qw"] <= 0.005 and weekly_exhaust_sec is None:
+            if all(a["qw"] <= 0.005 for a in accs if not a["is_restricted"]):
+                weekly_exhaust_sec = t - now
+
+    is_sustainable_5h = (first_stall_sec is None or (first_stall_cause == "weekly" and first_stall_sec > 48 * 3600))
+    is_sustainable_weekly = (weekly_exhaust_sec is None)
+
+    return {
+        "first_stall_sec": first_stall_sec,
+        "first_stall_cause": first_stall_cause,
+        "stall_duration_sec": stall_duration_sec,
+        "first_empty_acc_id": first_empty_acc_id,
+        "first_empty_sec": first_empty_sec,
+        "weekly_exhaust_sec": weekly_exhaust_sec,
+        "is_sustainable_5h": is_sustainable_5h,
+        "is_sustainable_weekly": is_sustainable_weekly,
+    }
+
+
+def simulate_quota_runway(pool, pace_gens_per_hour=None, now=None, sim_hours=168):
+    """
+    Evaluates pool endurance by combining telemetry, staggered resets, and dual windows.
+    Returns complete forecast metrics for current pace and standard benchmark pace.
+    """
+    if now is None:
+        now = time.time()
+    accounts = pool.get("accounts", []) if isinstance(pool, dict) else []
+    if not accounts:
+        return {"status": "no_accounts", "healthy_count": 0, "total_accounts": 0}
+
+    sim_accs = []
+    for acc in accounts:
+        status = acc.get("status")
+        is_restricted = status in ("validation_required", "auth_error")
+        cooldown_until = float(acc.get("rate_limited_until", 0))
+
+        q = acc.get("last_quota", {})
+        g5_frac, gw_frac = _display_quota_fractions(q)
+        q5 = g5_frac if g5_frac is not None else 1.0
+        qw = gw_frac if gw_frac is not None else 1.0
+
+        g5 = q.get("gemini_5h", {}) if isinstance(q, dict) else {}
+        gw = q.get("gemini_weekly", {}) if isinstance(q, dict) else {}
+        reset5 = g5.get("reset_time") if isinstance(g5, dict) else None
+        resetw = gw.get("reset_time") if isinstance(gw, dict) else None
+        if not reset5 and not resetw:
+            reset5 = resetw = q.get("reset_time") if isinstance(q, dict) else None
+
+        reset5_ts = _parse_iso_or_timestamp(reset5)
+        if reset5_ts is None or reset5_ts < now:
+            reset5_ts = now + WINDOW_5H_SECS
+
+        resetw_ts = _parse_iso_or_timestamp(resetw)
+        if resetw_ts is None or resetw_ts < now:
+            resetw_ts = now + WINDOW_7D_SECS
+
+        sim_accs.append({
+            "id": acc.get("id"),
+            "display_name": display_account_name(acc),
+            "is_restricted": is_restricted,
+            "cooldown_until": cooldown_until,
+            "q5": q5,
+            "qw": qw,
+            "reset5_ts": reset5_ts,
+            "resetw_ts": resetw_ts,
+            "sim_hits": acc.get("gen_count", 0),
+        })
+
+    healthy_count = sum(1 for a in sim_accs if not a["is_restricted"])
+    cooling_count = sum(1 for a in sim_accs if not a["is_restricted"] and a["cooldown_until"] > now)
+    restricted_count = sum(1 for a in sim_accs if a["is_restricted"])
+
+    if healthy_count == 0:
+        return {
+            "status": "all_restricted",
+            "healthy_count": 0,
+            "cooling_count": 0,
+            "restricted_count": restricted_count,
+            "total_accounts": len(accounts),
+            "message": "All accounts are restricted (verification required or auth error)"
+        }
+
+    telemetry = get_burn_rate(pool, now=now)
+    strategy = pool.get("strategy", "max_quota")
+
+    if pace_gens_per_hour is not None:
+        target_pace = max(0.0, float(pace_gens_per_hour))
+        is_custom_pace = True
+    else:
+        target_pace = telemetry["gens_per_hour"]
+        is_custom_pace = False
+
+    is_idle = (target_pace == 0.0)
+
+    current_sim = _run_single_simulation(sim_accs, target_pace, strategy, now, sim_hours=sim_hours)
+    benchmark_sim = _run_single_simulation(sim_accs, BENCHMARK_PACE_GENS_PER_HOUR, strategy, now, sim_hours=sim_hours)
+
+    replenish_rate = healthy_count * 20.0
+    burn_rate_pct = target_pace * DEFAULT_FRACTION_PER_HIT_5H * 100.0
+    net_rate_pct = replenish_rate - burn_rate_pct
+
+    total_q5 = sum(a["q5"] for a in sim_accs if not a["is_restricted"]) * 100.0
+    total_qw = sum(a["qw"] for a in sim_accs if not a["is_restricted"]) * 100.0
+
+    return {
+        "status": "ok",
+        "healthy_count": healthy_count,
+        "cooling_count": cooling_count,
+        "restricted_count": restricted_count,
+        "total_accounts": len(accounts),
+        "strategy": strategy,
+        "target_pace": target_pace,
+        "is_custom_pace": is_custom_pace,
+        "is_idle": is_idle,
+        "telemetry": telemetry,
+        "replenish_rate_pct_hr": replenish_rate,
+        "burn_rate_pct_hr": burn_rate_pct,
+        "net_rate_pct_hr": net_rate_pct,
+        "total_q5_pct": total_q5,
+        "total_qw_pct": total_qw,
+        "current_runway": current_sim,
+        "benchmark_runway": benchmark_sim,
+        "accounts_forecast": [{
+            "id": a["id"],
+            "display_name": a["display_name"],
+            "q5_pct": round(a["q5"] * 100.0, 1),
+            "qw_pct": round(a["qw"] * 100.0, 1),
+            "reset5_in_sec": max(0, int(a["reset5_ts"] - now)),
+            "resetw_in_sec": max(0, int(a["resetw_ts"] - now)),
+            "is_cooling": a["cooldown_until"] > now,
+            "is_restricted": a["is_restricted"],
+        } for a in sim_accs]
+    }
+
+
+def _format_duration_short(sec):
+    if sec is None:
+        return "N/A"
+    sec = max(0, int(sec))
+    days, rem = divmod(sec, 86400)
+    hours, rem = divmod(rem, 3600)
+    mins, s = divmod(rem, 60)
+    if days > 0:
+        return f"{days}d {hours}h"
+    if hours > 0:
+        return f"{hours}h {mins:02d}m"
+    if mins > 0:
+        return f"{mins}m"
+    return f"{s}s"
+
+
+def print_runway_summary(pool, now=None):
+    """Renders compact runway forecast block inside the main quota dashboard."""
+    res = simulate_quota_runway(pool, now=now)
+    status = res.get("status")
+    if status in ("no_accounts", "all_restricted"):
+        return
+
+    sub_sep = "-" * 68
+    print(sub_sep)
+    print(f" {CLR_BOLD}{CLR_CYAN}⚡ Quota Runway & Endurance Forecast:{CLR_RESET}")
+
+    h_count = res["healthy_count"]
+    tot = res["total_accounts"]
+    cool = res["cooling_count"]
+    is_idle = res["is_idle"]
+    pace = res["target_pace"]
+    sim = res["current_runway"]
+    bench = res["benchmark_runway"]
+
+    health_info = f"{h_count}/{tot} Active"
+    if cool > 0:
+        health_info += f" ({cool} Cooling)"
+
+    if is_idle:
+        pace_info = f"{CLR_DIM}Idle (0 gens/hr){CLR_RESET}"
+    else:
+        pace_info = f"{CLR_BOLD}{pace:.1f} gens/hr{CLR_RESET} ({CLR_CYAN}{res['telemetry']['window_used']} window{CLR_RESET})"
+
+    print(f"  • Health & Pace:   {health_info} | {pace_info}")
+
+    replenish = res["replenish_rate_pct_hr"]
+    if not is_idle:
+        burn = res["burn_rate_pct_hr"]
+        net = res["net_rate_pct_hr"]
+        sign = "+" if net >= 0 else ""
+        net_color = CLR_GREEN if net >= 0 else CLR_YELLOW
+        print(f"  • Burn/Replenish:  ~{burn:.1f}%/hr burn | +{replenish:.1f}%/hr reload ({net_color}{sign}{net:.1f}%/hr net{CLR_RESET})")
+    else:
+        print(f"  • Capacity Reload: +{replenish:.1f}%/hr natural recovery across pool")
+
+    # 5-hour rolling runway
+    if is_idle:
+        if bench["is_sustainable_5h"]:
+            b_5h = f"{CLR_GREEN}⚡ Sustainable{CLR_RESET} (> 24h at standard ~20 gens/hr pace)"
+        elif bench["first_stall_sec"] is not None:
+            stall_str = _format_duration_short(bench["first_stall_sec"])
+            b_5h = f"{CLR_YELLOW}~{stall_str}{CLR_RESET} at standard ~20 gens/hr pace"
+        else:
+            b_5h = f"{CLR_GREEN}⚡ Sustainable{CLR_RESET}"
+        print(f"  • Active Coding:   {b_5h}")
+    else:
+        if sim["is_sustainable_5h"]:
+            run_5h = f"{CLR_GREEN}⚡ Sustainable{CLR_RESET} (Pool replenishes faster than burn rate)"
+        elif sim["first_stall_sec"] is not None:
+            stall_str = _format_duration_short(sim["first_stall_sec"])
+            cause_note = ""
+            if sim["stall_duration_sec"] is not None and sim["stall_duration_sec"] > 0:
+                pause_str = _format_duration_short(sim["stall_duration_sec"])
+                cause_note = f" (Dry pause: ~{pause_str} until next reset)"
+            run_5h = f"{CLR_YELLOW}~{stall_str} until first stall{CLR_RESET}{cause_note}"
+        else:
+            run_5h = f"{CLR_GREEN}⚡ Sustainable{CLR_RESET}"
+        print(f"  • 5-Hour Runway:   {run_5h}")
+
+    # Weekly budget runway
+    active_sim = bench if is_idle else sim
+    if active_sim["is_sustainable_weekly"]:
+        w_run = f"{CLR_GREEN}⚡ Sustainable{CLR_RESET} (> 7 Days remaining)"
+    elif active_sim["weekly_exhaust_sec"] is not None:
+        w_days = active_sim["weekly_exhaust_sec"] / 86400.0
+        w_color = CLR_YELLOW if w_days > 2.0 else CLR_RED
+        w_run = f"{w_color}~{w_days:.1f} Days remaining{CLR_RESET}"
+    else:
+        w_run = f"{CLR_GREEN}⚡ Sustainable{CLR_RESET}"
+
+    w_label = "Weekly Budget:  " if is_idle else "Weekly Runway:  "
+    print(f"  • {w_label} {w_run}")
+
+
+def show_forecast(pace=None, json_output=False):
+    """CLI handler for detailed quota runway and endurance predictions."""
+    pool = load_pool()
+    accounts = pool.get("accounts", [])
+    if not accounts:
+        if json_output:
+            print(json.dumps({"status": "no_accounts", "error": "No accounts in pool yet"}, indent=2))
+        else:
+            print(f"\n{CLR_YELLOW}No accounts in pool yet.{CLR_RESET}")
+            print(f"Run {CLR_BOLD}agy-pool login{CLR_RESET} or {CLR_BOLD}agy-pool import-current{CLR_RESET} to add accounts.\n")
+        return
+
+    res = simulate_quota_runway(pool, pace_gens_per_hour=pace)
+    if json_output:
+        print(json.dumps(res, indent=2, ensure_ascii=False))
+        return
+
+    if res["status"] == "all_restricted":
+        print(f"\n{CLR_RED}[Error] All accounts are restricted (security verification required or auth failure).{CLR_RESET}")
+        print(f"Run {CLR_BOLD}agy-pool verify{CLR_RESET} to unlock restricted accounts in browser.\n")
+        return
+
+    sep = "=" * 68
+    sub_sep = "-" * 68
+    print("\n" + sep)
+    title = f"Quota Runway & Endurance Forecast (v{VERSION})"
+    print(f"{CLR_BOLD}{title:^68}{CLR_RESET}")
+    print(sep)
+
+    pace_mode = "User Specified" if res["is_custom_pace"] else ("Idle (Reference Pace)" if res["is_idle"] else f"Measured ({res['telemetry']['window_used']} window)")
+    eff_pace = res["target_pace"] if not res["is_idle"] else BENCHMARK_PACE_GENS_PER_HOUR
+    active_sim = res["current_runway"] if not res["is_idle"] else res["benchmark_runway"]
+
+    print(f"  Pool Health:     {CLR_BOLD}{res['healthy_count']}/{res['total_accounts']}{CLR_RESET} Accounts Active ({res['cooling_count']} Cooling, {res['restricted_count']} Restricted)")
+    print(f"  Active Strategy: {CLR_BOLD}{res['strategy']}{CLR_RESET}")
+    print(f"  Simulated Pace:  {CLR_BOLD}{eff_pace:.1f} generations/hour{CLR_RESET} ({pace_mode})")
+    print(f"  Stock on Hand:   {CLR_BOLD}{res['total_q5_pct']:.1f}%{CLR_RESET} total 5h quota | {CLR_BOLD}{res['total_qw_pct']:.1f}%{CLR_RESET} total weekly quota")
+
+    print("\n" + f"{CLR_BOLD}[5-Hour Rolling Burst Runway]{CLR_RESET}")
+    burn = eff_pace * DEFAULT_FRACTION_PER_HIT_5H * 100.0
+    replenish = res["replenish_rate_pct_hr"]
+    net = replenish - burn
+    net_sign = "+" if net >= 0 else ""
+    net_color = CLR_GREEN if net >= 0 else CLR_YELLOW
+    print(f"  • Natural Replenish:  +{replenish:.1f}%/hr ({res['healthy_count']} accounts × 20.0%/hr)")
+    print(f"  • Estimated Burn:     ~{burn:.1f}%/hr (~0.75% per generation)")
+    print(f"  • Net Balance:        {net_color}{net_sign}{net:.1f}%/hr{CLR_RESET} ({'Surplus' if net >= 0 else 'Deficit'})")
+
+    if active_sim["is_sustainable_5h"]:
+        print(f"  • 5-Hour Status:      {CLR_GREEN}⚡ SUSTAINABLE{CLR_RESET} (Pool regenerates faster than consumption)")
+        print(f"  • Continuous Burst:   {CLR_GREEN}> 48 Hours{CLR_RESET} (No 5h quota starvation expected)")
+    else:
+        stall_str = _format_duration_short(active_sim["first_stall_sec"])
+        print(f"  • 5-Hour Status:      {CLR_YELLOW}🔻 DRAINING{CLR_RESET}")
+        print(f"  • Time to 1st Stall:  {CLR_YELLOW}~{stall_str}{CLR_RESET}")
+        if active_sim["stall_duration_sec"]:
+            pause_str = _format_duration_short(active_sim["stall_duration_sec"])
+            print(f"  • Dry Period Pause:   ~{pause_str} until next account reset")
+        if active_sim["first_empty_acc_id"]:
+            print(f"  • 1st Account Empty:  Account {active_sim['first_empty_acc_id']}")
+
+    print("\n" + f"{CLR_BOLD}[Weekly Budget Runway]{CLR_RESET}")
+    weekly_burn = eff_pace * DEFAULT_FRACTION_PER_HIT_WEEKLY * 100.0
+    print(f"  • Weekly Burn Rate:   ~{weekly_burn:.2f}%/hr (~0.15% per generation)")
+    if active_sim["is_sustainable_weekly"]:
+        print(f"  • Weekly Status:      {CLR_GREEN}⚡ SUSTAINABLE{CLR_RESET} (> 7 Days capacity on hand)")
+    else:
+        w_days = active_sim["weekly_exhaust_sec"] / 86400.0
+        w_color = CLR_YELLOW if w_days > 2.0 else CLR_RED
+        print(f"  • Weekly Status:      {w_color}⚠ WEEKLY LIMIT PINCH{CLR_RESET}")
+        print(f"  • Weekly Runway:      {w_color}~{w_days:.1f} Days remaining{CLR_RESET}")
+
+    print("\n" + f"{CLR_BOLD}[Staggered Reset Timeline]{CLR_RESET}")
+    for a in res["accounts_forecast"]:
+        r5_str = _format_duration_short(a["reset5_in_sec"])
+        rw_str = _format_duration_short(a["resetw_in_sec"])
+        status_tag = ""
+        if a["is_restricted"]:
+            status_tag = f" {CLR_RED}[Restricted]{CLR_RESET}"
+        elif a["is_cooling"]:
+            status_tag = f" {CLR_YELLOW}[Cooldown]{CLR_RESET}"
+        print(f"  • {a['display_name']}: 5h in {r5_str} (Now: {a['q5_pct']}%) | Weekly in {rw_str} (Now: {a['qw_pct']}%){status_tag}")
+
+    print(sub_sep)
+    print(f"{CLR_DIM}Run 'agy-pool forecast --pace <N>' to simulate custom generation rates.{CLR_RESET}")
+    print(sep + "\n")
+
+
 class SmartProxyHandler(http.server.BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
@@ -2512,8 +3021,10 @@ class SmartProxyHandler(http.server.BaseHTTPRequestHandler):
                 return
             stored["request_count"] = stored.get("request_count", 0) + 1
             if is_generation:
+                now_ts = int(time.time())
                 stored["gen_count"] = stored.get("gen_count", 0) + 1
-                stored["last_used_at"] = int(time.time())
+                stored["last_used_at"] = now_ts
+                record_generation_telemetry(pool, stored.get("id"), now=now_ts)
             if stored.get("status") in ("validation_required", "auth_error"):
                 stored.pop("status", None)
                 stored.pop("validation_url", None)
@@ -3166,6 +3677,10 @@ def main():
     stat_p = subparsers.add_parser("status", help="Check status of proxy daemon and pool")
     stat_p.add_argument("--show-email", dest="show_email", action="store_true", default=None, help="Display real email addresses instead of masking")
     stat_p.add_argument("--hide-email", dest="show_email", action="store_false", help="Hide real email addresses (mask with friendly names/aliases)")
+    # forecast / runway
+    fore_p = subparsers.add_parser("forecast", aliases=["runway", "predict"], help="Predict quota endurance and runway based on usage and staggered resets")
+    fore_p.add_argument("--pace", type=float, default=None, help="Simulate a custom burn rate in generations per hour (e.g. --pace 30)")
+    fore_p.add_argument("--json", action="store_true", help="Output runway forecast in structured JSON format")
     # config
     cfg_p = subparsers.add_parser("config", help="View or update pool configuration settings (e.g. show_email, strategy)")
     cfg_p.add_argument("key", nargs="?", default=None, help="Configuration key (show_email, strategy)")
@@ -3189,6 +3704,8 @@ def main():
         import_current()
     elif cmd in ["list", "ls", "quota"]:
         list_accounts(getattr(args, "target", None), show_email=getattr(args, "show_email", None))
+    elif cmd in ["forecast", "runway", "predict"]:
+        show_forecast(pace=args.pace, json_output=args.json)
     elif cmd in ["remove", "rm"]:
         remove_account(args.target)
     elif cmd == "switch":

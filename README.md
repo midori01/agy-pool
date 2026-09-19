@@ -69,6 +69,7 @@ The installer validates Python 3, sets up symlinks (`agy-pool`, `agy-raw`), conf
 | `agy-pool remove <ID>` | Remove an account from the pool |
 | `agy-pool start / stop` | Manage the background gateway daemon (`127.0.0.1:8899`) |
 | `agy-pool log [-f]` | Inspect or follow proxy daemon log (`--rotate`, `--clear`) |
+| `agy-pool forecast` | Predict quota runway, burn rates, and staggered replenishment (`--pace`, `--json`) |
 | `agy-pool export [-e]` | Export accounts (plain or encrypted with `-e` / `--password`) |
 | `agy-pool import <file>`| Restore/merge accounts from backup (supports `-` for stdin) |
 
@@ -91,6 +92,12 @@ The installer validates Python 3, sets up symlinks (`agy-pool`, `agy-raw`), conf
  [* Active] CLI Base Token    [Ready] In Rotation Pool
  [Cooldown] Rate Limited      [Exhausted] Quota Depleted
  Strategy: max_quota | Gateway Proxy: RUNNING (127.0.0.1:8899)
+--------------------------------------------------------------------
+⚡ Quota Runway & Endurance Forecast:
+  • Health & Pace:   3/3 Active | ~18.5 gens/hr (15m window)
+  • Burn/Replenish:  ~13.9%/hr burn | +60.0%/hr reload (+46.1%/hr net)
+  • 5-Hour Runway:   ⚡ Sustainable (Pool replenishes faster than burn rate)
+  • Weekly Runway:   ~5.4 Days remaining
 ====================================================================
 ```
 
