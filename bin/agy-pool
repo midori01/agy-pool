@@ -32,6 +32,7 @@ import getpass
 import http.client
 import tempfile
 import errno
+import collections
 from datetime import datetime, timezone
 
 try:
@@ -41,13 +42,40 @@ except ImportError:
     HAS_FCNTL = False
 
 # ----------------- Constants & Configuration -----------------
-VERSION = "0.1.0-beta.3"
+VERSION = "0.1.0-beta.4"
 QUOTA_FRESH_MAX_AGE = 60
 QUOTA_AGING_MAX_AGE = 300
 _QUOTA_REFRESH_LOCK = threading.Lock()
 _QUOTA_REFRESH_IN_FLIGHT = set()
 _QUOTA_REFRESH_RETRY = {}
 _QUOTA_REFRESH_BACKOFF = (30, 60, 120, 240, 300)
+
+_IN_FLIGHT_LOCK = threading.Lock()
+_IN_FLIGHT_GENERATIONS = collections.defaultdict(int)
+
+def get_in_flight_count(account_id):
+    with _IN_FLIGHT_LOCK:
+        return _IN_FLIGHT_GENERATIONS.get(account_id, 0)
+
+def get_all_in_flight_counts():
+    with _IN_FLIGHT_LOCK:
+        return dict(_IN_FLIGHT_GENERATIONS)
+
+@contextlib.contextmanager
+def track_in_flight_generation(account_id):
+    if not account_id:
+        yield
+        return
+    with _IN_FLIGHT_LOCK:
+        _IN_FLIGHT_GENERATIONS[account_id] += 1
+    try:
+        yield
+    finally:
+        with _IN_FLIGHT_LOCK:
+            _IN_FLIGHT_GENERATIONS[account_id] -= 1
+            if _IN_FLIGHT_GENERATIONS[account_id] <= 0:
+                _IN_FLIGHT_GENERATIONS.pop(account_id, None)
+
 def _decode_cred(h, k=0x5A):
     return bytes([b ^ k for b in bytes.fromhex(h)]).decode()
 
@@ -607,6 +635,37 @@ def _is_auth_error(status, body):
     return False
 
 
+def _is_token_auth_error(error):
+    """
+    Returns True if an error during token refresh is provably a credential/account failure
+    (e.g. invalid_grant, token revoked, account disabled), rather than a network/transport error.
+    """
+    if isinstance(error, ValueError) and "Missing refresh_token" in str(error):
+        return True
+    if isinstance(error, urllib.error.HTTPError):
+        if error.code in (400, 401):
+            err_body = b""
+            try:
+                err_body = error.read()
+            except Exception:
+                pass
+            finally:
+                try:
+                    error.close()
+                except Exception:
+                    pass
+            text = err_body.decode("utf-8", errors="ignore").lower() if isinstance(err_body, (bytes, bytearray)) else str(err_body).lower()
+            return _is_auth_error(error.code, err_body) or any(
+                marker in text for marker in (
+                    "invalid_grant", "unauthorized_client", "invalid_client",
+                    "account is disabled", "user disabled", "deleted_client"
+                )
+            )
+        return False
+    return False
+
+
+
 def _quota_fraction(value):
     """Return a bounded quota fraction, or None when the value is unknown/invalid."""
     try:
@@ -734,10 +793,17 @@ def query_quota(account):
 
     except urllib.error.HTTPError as e:
         quota_error = e
+        err_body = b""
         try:
-            err_body = e.read()
-        except Exception:
-            err_body = b""
+            try:
+                err_body = e.read()
+            except Exception:
+                err_body = b""
+        finally:
+            try:
+                e.close()
+            except Exception:
+                pass
         if _is_validation_error(e.code, err_body) or _is_auth_error(e.code, err_body):
             validation = _is_validation_error(e.code, err_body)
             status = "validation_required" if validation else "auth_error"
@@ -1008,7 +1074,17 @@ def do_login():
         with urllib.request.urlopen(req, timeout=10) as resp:
             token_res = json.loads(resp.read().decode())
     except urllib.error.HTTPError as e:
-        print(f"{CLR_RED}[Error] OAuth exchange failed: {e.read().decode()}{CLR_RESET}")
+        err_msg = ""
+        try:
+            err_msg = e.read().decode("utf-8", "ignore")
+        except Exception:
+            pass
+        finally:
+            try:
+                e.close()
+            except Exception:
+                pass
+        print(f"{CLR_RED}[Error] OAuth exchange failed: {err_msg}{CLR_RESET}")
         return False
 
     refresh_tok = token_res.get("refresh_token")
@@ -2162,17 +2238,17 @@ def _is_uncommitted_transport_error(error):
     if err_no in UNCOMMITTED_ERRNOS:
         return True
 
-    if isinstance(target, str):
-        low = target.lower()
-        if any(msg in low for msg in (
-            "connection refused",
-            "name or service not known",
-            "nodename nor servname provided",
-            "network is unreachable",
-            "no route to host",
-            "network is down",
-        )):
-            return True
+    target_str = str(target).lower()
+    if any(msg in target_str for msg in (
+        "connection refused",
+        "name or service not known",
+        "nodename nor servname provided",
+        "network is unreachable",
+        "no route to host",
+        "network is down",
+        "address not available",
+    )):
+        return True
 
     return False
 
@@ -2368,7 +2444,7 @@ def _get_remaining_fraction(acc):
         return 1.0
 
 
-def order_candidates(candidates, strategy="max_quota", pool=None, now=None):
+def order_candidates(candidates, strategy="max_quota", pool=None, now=None, in_flight_counts=None):
     """
     Orders account candidates for AI generation according to the chosen load balancing strategy.
 
@@ -2381,6 +2457,7 @@ def order_candidates(candidates, strategy="max_quota", pool=None, now=None):
     Strategies applied strictly to the eligible account set:
       - max_quota: Prioritizes accounts with safest remaining 5-hour and weekly capacity (worst_pace,
         total_pace, raw_floor descending at full precision), breaking ties by lowest Hits.
+        Applies active in-flight request bias to distribute parallel bursts across idle accounts.
       - least_used: Lowest generation count (Hits), breaking ties by reset-aware capacity pace,
         raw quota floor, then account ID.
       - round_robin: Sequential rotation starting after round_robin_last_account_id, wrapping around.
@@ -2391,6 +2468,8 @@ def order_candidates(candidates, strategy="max_quota", pool=None, now=None):
         now = time.time()
     if pool is None:
         pool = {}
+    if in_flight_counts is None:
+        in_flight_counts = get_all_in_flight_counts()
 
     eligible = []
     depleted = []
@@ -2416,7 +2495,9 @@ def order_candidates(candidates, strategy="max_quota", pool=None, now=None):
         def _least_used_key(a):
             cap = compute_capacity_state(a, now=now)
             hits = a.get("gen_count", a.get("request_count", 0))
+            in_flight = in_flight_counts.get(a.get("id", ""), 0)
             return (
+                in_flight,
                 hits,
                 -cap["known_window_count"],
                 -quota_freshness_rank(a, now=now),
@@ -2437,7 +2518,9 @@ def order_candidates(candidates, strategy="max_quota", pool=None, now=None):
         def _max_quota_key(a):
             cap = compute_capacity_state(a, now=now)
             hits = a.get("gen_count", a.get("request_count", 0))
+            in_flight = in_flight_counts.get(a.get("id", ""), 0)
             return (
+                -in_flight,
                 cap["known_window_count"],
                 quota_freshness_rank(a, now=now),
                 cap["worst_pace"],
@@ -2760,11 +2843,23 @@ def simulate_quota_runway(pool, pace_gens_per_hour=None, now=None, sim_hours=168
             reset5 = resetw = q.get("reset_time") if isinstance(q, dict) else None
 
         reset5_ts = _parse_iso_or_timestamp(reset5)
-        if reset5_ts is None or reset5_ts < now:
+        resetw_ts = _parse_iso_or_timestamp(resetw)
+        last_updated = _parse_iso_or_timestamp(q.get("updated_at")) if isinstance(q, dict) else None
+
+        if reset5_ts is not None and reset5_ts <= now:
+            if last_updated is None or last_updated < reset5_ts:
+                q5 = 1.0
+            while reset5_ts <= now:
+                reset5_ts += WINDOW_5H_SECS
+        elif reset5_ts is None:
             reset5_ts = now + WINDOW_5H_SECS
 
-        resetw_ts = _parse_iso_or_timestamp(resetw)
-        if resetw_ts is None or resetw_ts < now:
+        if resetw_ts is not None and resetw_ts <= now:
+            if last_updated is None or last_updated < resetw_ts:
+                qw = 1.0
+            while resetw_ts <= now:
+                resetw_ts += WINDOW_7D_SECS
+        elif resetw_ts is None:
             resetw_ts = now + WINDOW_7D_SECS
 
         sim_accs.append({
@@ -3295,10 +3390,10 @@ class SmartProxyHandler(http.server.BaseHTTPRequestHandler):
                 last_error = e
                 sys.stderr.write(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [PROXY WARN] Token refresh failed for {display_account_name(acc)}: {e}. Switching to next account...\n")
                 sys.stderr.flush()
-                if _is_uncommitted_transport_error(e):
-                    self._record_transport_error(acc)
-                else:
+                if _is_token_auth_error(e):
                     self._record_auth_error(acc)
+                else:
+                    self._record_transport_error(acc)
                 continue
 
             target_url = f"{BACKEND_URL_BASE}{path}"
@@ -3313,25 +3408,26 @@ class SmartProxyHandler(http.server.BaseHTTPRequestHandler):
             req = urllib.request.Request(target_url, data=req_data, headers=headers, method=self.command)
 
             try:
-                with urllib.request.urlopen(req, timeout=300) as resp:
-                    status = resp.status
-                    sys.stderr.write(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [PROXY] {self.command} {path.split('/')[-1]} -> {display_account_name(acc)} (Status: {status})\n")
-                    sys.stderr.flush()
+                with track_in_flight_generation(acc.get("id")) if is_generation else contextlib.nullcontext():
+                    with urllib.request.urlopen(req, timeout=300) as resp:
+                        status = resp.status
+                        sys.stderr.write(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [PROXY] {self.command} {path.split('/')[-1]} -> {display_account_name(acc)} (Status: {status})\n")
+                        sys.stderr.flush()
 
-                    resp_content_type = str(resp.headers.get("Content-Type", "")).lower()
-                    is_stream = is_sse or ("text/event-stream" in resp_content_type)
+                        resp_content_type = str(resp.headers.get("Content-Type", "")).lower()
+                        is_stream = is_sse or ("text/event-stream" in resp_content_type)
 
-                    if is_stream:
-                        self._record_success(acc, is_generation=is_generation)
-                        self._send_stream(status, resp.headers, resp)
-                    else:
-                        resp_body = resp.read()
-                        self._record_success(acc, is_generation=is_generation)
-                        try:
-                            self._send_buffered(status, resp.headers, resp_body)
-                        except (BrokenPipeError, ConnectionResetError):
-                            pass
-                    return
+                        if is_stream:
+                            self._record_success(acc, is_generation=is_generation)
+                            self._send_stream(status, resp.headers, resp)
+                        else:
+                            resp_body = resp.read()
+                            self._record_success(acc, is_generation=is_generation)
+                            try:
+                                self._send_buffered(status, resp.headers, resp_body)
+                            except (BrokenPipeError, ConnectionResetError):
+                                pass
+                        return
 
             except urllib.error.HTTPError as e:
                 last_error = e

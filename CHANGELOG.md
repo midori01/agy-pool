@@ -5,6 +5,24 @@ All notable changes to the `agy-pool` project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.0-beta.4] - 2026-09-19
+
+### Fixed
+- **Token Refresh False-Positive `auth_error` Elimination**:
+  - Replaced overly aggressive uncommitted transport error classification during token refresh with dedicated `_is_token_auth_error()`.
+  - Transient network timeouts (`socket.timeout`, `TimeoutError`), remote disconnects (`http.client.RemoteDisconnected`), and cellular network switches during OAuth token refresh are now properly recorded as transport errors instead of falsely flagging valid credentials as `auth_error` with a 1-hour ban.
+- **Uncommitted Transport Error Matching on Exception Objects**:
+  - Fixed `_is_uncommitted_transport_error()` evaluating `isinstance(target, str)` against `URLError.reason` exception objects (such as `socket.gaierror` or `OSError`), which caused string pattern matching for network failures ("name or service not known", "nodename nor servname provided") to fail silently.
+- **In-Flight Concurrency Awareness & Burst Desynchronization**:
+  - Implemented thread-safe in-flight request tracking (`track_in_flight_generation()`) in the proxy daemon.
+  - Enhanced `max_quota` and `least_used` candidate selection strategies with active in-flight request bias, eliminating thundering herd stampedes where concurrent parallel agent calls all routed to the identical single highest account and triggered 429 rate limits.
+- **Simulated Quota Runway Stale Reset Normalization**:
+  - Corrected `simulate_quota_runway()` handling for accounts whose reset timestamp had elapsed prior to the current time, automatically recognizing that Google has already replenished the bucket to 100% and rolling the next reset timestamp forward into the future.
+- **Resource Hygiene & Descriptor Leak Prevention**:
+  - Added explicit `finally: e.close()` cleanup to `HTTPError` handlers in `query_quota()` and `do_login()`, eliminating Python 3.14 `ResourceWarning` on unclosed response buffers.
+- **Automated Test Coverage Expansion**:
+  - Added 5 new comprehensive test cases covering in-flight concurrency bias, token refresh error classification, past reset advancement, and exception string matching, bringing the test suite to 104 tests with 100% pass rate.
+
 ## [0.1.0-beta.3] - 2026-09-19
 
 ### Fixed

@@ -2665,6 +2665,110 @@ class AgyPoolTest(unittest.TestCase):
         self.assertFalse(res["is_idle"])
         self.assertTrue(res["current_runway"]["is_sustainable_weekly"])
 
+    def test_in_flight_generation_tracking_and_max_quota_concurrency_bias(self):
+        now = time.time()
+        acc1 = account("a")
+        acc1["last_quota"] = {"gemini_5h": {"fraction": 1.0, "reset_time": now + 10000}}
+        acc2 = account("b")
+        acc2["last_quota"] = {"gemini_5h": {"fraction": 1.0, "reset_time": now + 10000}}
+
+        # When no in-flight requests, a and b ordered by default
+        ordered_idle = agy_pool.order_candidates([acc1, acc2], strategy="max_quota", now=now)
+        self.assertEqual(ordered_idle[0]["id"], "a")
+
+        # When account 'a' has an active in-flight request, 'b' is prioritized
+        with agy_pool.track_in_flight_generation("a"):
+            self.assertEqual(agy_pool.get_in_flight_count("a"), 1)
+            ordered_active = agy_pool.order_candidates([acc1, acc2], strategy="max_quota", now=now)
+            self.assertEqual(ordered_active[0]["id"], "b")
+
+            # Under least_used as well
+            ordered_lu = agy_pool.order_candidates([acc1, acc2], strategy="least_used", now=now)
+            self.assertEqual(ordered_lu[0]["id"], "b")
+
+        self.assertEqual(agy_pool.get_in_flight_count("a"), 0)
+
+    def test_token_refresh_error_classification(self):
+        # Transport errors should NOT be classified as auth errors
+        self.assertFalse(agy_pool._is_token_auth_error(TimeoutError("timed out")))
+        self.assertFalse(agy_pool._is_token_auth_error(socket.timeout("timed out")))
+        self.assertFalse(agy_pool._is_token_auth_error(http.client.RemoteDisconnected("Remote end closed connection")))
+        self.assertFalse(agy_pool._is_token_auth_error(urllib.error.URLError(socket.gaierror(-2, "Name or service not known"))))
+
+        # True auth errors must be classified as auth errors
+        self.assertTrue(agy_pool._is_token_auth_error(ValueError("Missing refresh_token")))
+
+        # HTTPError 400 with invalid_grant is auth error
+        err_msg = email.message.Message()
+        err_msg["Content-Type"] = "application/json"
+        http_err = urllib.error.HTTPError("https://oauth2.googleapis.com/token", 400, "Bad Request", err_msg, io.BytesIO(b'{"error": "invalid_grant"}'))
+        self.assertTrue(agy_pool._is_token_auth_error(http_err))
+
+    def test_proxy_token_refresh_timeout_does_not_mark_auth_error(self):
+        self.save_accounts([account("a"), account("b")])
+        proxy = self.start_server(agy_pool.SmartProxyHandler)
+
+        def refresh_mock(acc):
+            if acc["id"] == "a":
+                raise socket.timeout("timed out")
+            return "token-b"
+
+        class DummyResponse:
+            status = 200
+            def __init__(self):
+                self.headers = email.message.Message()
+                self.headers["Content-Type"] = "application/json"
+                self._body = io.BytesIO(b'{"ok": true}')
+            def __enter__(self):
+                return self
+            def __exit__(self, *args):
+                pass
+            def read(self, size=-1):
+                return self._body.read(size)
+            def read1(self, size=-1):
+                return self._body.read(size)
+
+        with mock.patch.object(agy_pool, "refresh_token", refresh_mock), \
+             mock.patch.object(agy_pool.urllib.request, "urlopen", side_effect=lambda *args, **kwargs: DummyResponse()):
+            status, body, _ = self.request(proxy, "/v1internal:generateContent")
+
+        self.assertEqual(status, 200)
+        self.assertIn(b"ok", body)
+
+        pool = agy_pool.load_pool()
+        acc_a = next(a for a in pool["accounts"] if a["id"] == "a")
+        # Account A must NOT be marked as auth_error and must NOT have rate_limited_until ban
+        self.assertNotEqual(acc_a.get("status"), "auth_error")
+        self.assertIsNone(acc_a.get("rate_limited_until"))
+
+    def test_uncommitted_transport_error_handles_exception_objects(self):
+        e1 = urllib.error.URLError(Exception("nodename nor servname provided"))
+        self.assertTrue(agy_pool._is_uncommitted_transport_error(e1))
+
+        e2 = urllib.error.URLError(Exception("network is unreachable"))
+        self.assertTrue(agy_pool._is_uncommitted_transport_error(e2))
+
+    def test_simulate_quota_runway_advances_past_resets(self):
+        now = 1000000.0
+        acc = account("a")
+        # Quota recorded 2 hours ago with reset 1 hour ago
+        acc["last_quota"] = {
+            "gemini_5h": {"fraction": 0.05, "reset_time": now - 3600},
+            "gemini_weekly": {"fraction": 0.05, "reset_time": now - 3600},
+            "updated_at": now - 7200
+        }
+        pool = {"accounts": [acc], "strategy": "max_quota"}
+        res = agy_pool.simulate_quota_runway(pool, now=now)
+        self.assertEqual(res["status"], "ok")
+        acc_forecast = res["accounts_forecast"][0]
+        # Because reset_time passed since updated_at, quota is recognized as replenished (100%)
+        self.assertEqual(acc_forecast["q5_pct"], 100.0)
+        self.assertEqual(acc_forecast["qw_pct"], 100.0)
+        # Next reset is rolled forward into the future
+        self.assertGreater(acc_forecast["reset5_in_sec"], 0)
+        self.assertGreater(acc_forecast["resetw_in_sec"], 0)
+
 
 if __name__ == "__main__":
     unittest.main()
+
