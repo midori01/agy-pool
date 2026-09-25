@@ -1362,6 +1362,51 @@ def sync_active_agy_token_file():
 
 
 # ----------------- Quota Display & Account Management -----------------
+def _resolve_account_index(target, accounts):
+    """
+    Resolves an account target (1-based index, account ID, exact email/name,
+    case-insensitive email/name, or unique substring) to its 0-based index in accounts.
+    Returns 0-based index if found, or None if not found or ambiguous.
+    """
+    if target is None or not accounts:
+        return None
+    target_str = str(target).strip()
+    if not target_str:
+        return None
+
+    # 1. 1-based integer index
+    if target_str.isdigit():
+        idx = int(target_str) - 1
+        if 0 <= idx < len(accounts):
+            return idx
+        return None
+
+    # 2. Exact match on 'id', 'email', or 'name'
+    for i, a in enumerate(accounts):
+        if a.get("id") == target_str or a.get("email") == target_str or a.get("name") == target_str:
+            return i
+
+    # 3. Case-insensitive exact match on email or name
+    target_lower = target_str.lower()
+    for i, a in enumerate(accounts):
+        email = (a.get("email") or "").strip().lower()
+        name = (a.get("name") or "").strip().lower()
+        if email == target_lower or name == target_lower:
+            return i
+
+    # 4. Unique substring match on email or name
+    matches = []
+    for i, a in enumerate(accounts):
+        email = (a.get("email") or "").strip().lower()
+        name = (a.get("name") or "").strip().lower()
+        if target_lower in email or target_lower in name:
+            matches.append(i)
+    if len(matches) == 1:
+        return matches[0]
+
+    return None
+
+
 def list_accounts(target=None, show_email=None):
     pool = load_pool()
     accounts = pool.get("accounts", [])
@@ -1379,20 +1424,12 @@ def list_accounts(target=None, show_email=None):
         accounts = pool.get("accounts", [])
 
     if target:
-        if str(target).isdigit():
-            idx = int(target) - 1
-            if 0 <= idx < len(accounts):
-                accounts = [accounts[idx]]
-            else:
-                print(f"{CLR_RED}[Error] Account '{target}' not found.{CLR_RESET}")
-                return
+        idx = _resolve_account_index(target, accounts)
+        if idx is not None:
+            accounts = [accounts[idx]]
         else:
-            found = next((a for a in accounts if a.get("id") == target or a.get("email") == target or a.get("name") == target), None)
-            if found:
-                accounts = [found]
-            else:
-                print(f"{CLR_RED}[Error] Account '{target}' not found.{CLR_RESET}")
-                return
+            print(f"{CLR_RED}[Error] Account '{target}' not found.{CLR_RESET}")
+            return
 
     print(f"\n{CLR_BOLD}{CLR_CYAN}Refreshing quota for {len(accounts)} account(s)...{CLR_RESET}")
     # Refresh all quotas concurrently
@@ -1408,12 +1445,8 @@ def list_accounts(target=None, show_email=None):
     if target:
         # Re-fetch filtered account after quota refresh
         all_accs = pool.get("accounts", [])
-        if str(target).isdigit():
-            idx = int(target) - 1
-            accounts = [all_accs[idx]] if 0 <= idx < len(all_accs) else []
-        else:
-            found = next((a for a in all_accs if a.get("id") == target or a.get("email") == target or a.get("name") == target), None)
-            accounts = [found] if found else []
+        idx = _resolve_account_index(target, all_accs)
+        accounts = [all_accs[idx]] if idx is not None else []
     else:
         accounts = pool.get("accounts", [])
 
@@ -1536,15 +1569,10 @@ def trigger_background_quota_refresh(account):
 def remove_account(target):
     def remove(pool):
         accounts = pool.get("accounts", [])
-        found = None
-        if target.isdigit():
-            idx = int(target) - 1
-            if 0 <= idx < len(accounts):
-                found = accounts[idx]
-        else:
-            found = next((a for a in accounts if a.get("id") == target or a.get("email") == target or a.get("name") == target), None)
-        if not found:
+        idx = _resolve_account_index(target, accounts)
+        if idx is None:
             return None
+        found = accounts[idx]
         pool["accounts"] = [a for a in accounts if a.get("id") != found.get("id")]
         if pool.get("active_account_id") == found.get("id"):
             pool["active_account_id"] = pool["accounts"][0]["id"] if pool["accounts"] else None
@@ -1569,15 +1597,10 @@ def rename_account(target, new_name=""):
     clean_name = new_name.strip() if new_name else None
     def update(pool):
         accounts = pool.get("accounts", [])
-        found = None
-        if str(target).isdigit():
-            idx = int(target) - 1
-            if 0 <= idx < len(accounts):
-                found = accounts[idx]
-        else:
-            found = next((a for a in accounts if a.get("id") == target or a.get("email") == target or a.get("name") == target), None)
-        if not found:
+        idx = _resolve_account_index(target, accounts)
+        if idx is None:
             return None
+        found = accounts[idx]
         found["name"] = clean_name
         return dict(found)
     found = pool_transaction(update)
@@ -1589,6 +1612,425 @@ def rename_account(target, new_name=""):
     else:
         print(f"{CLR_YELLOW}✓ Cleared custom name for account [{found.get('id')}].{CLR_RESET}")
     return True
+
+
+# ----------------- Account Reordering & Sorting -----------------
+def print_account_order_preview(accounts, highlight_indices=None, active_id=None, show_email=None):
+    """Prints a clean, concise list preview of account ordering."""
+    if highlight_indices is None:
+        highlight_indices = []
+    elif isinstance(highlight_indices, int):
+        highlight_indices = [highlight_indices]
+
+    if show_email is None:
+        show_email = is_show_email_enabled()
+
+    print(f"\n{CLR_BOLD}Account Pool Order ({len(accounts)} accounts):{CLR_RESET}")
+    for i, acc in enumerate(accounts, start=1):
+        idx_0 = i - 1
+        acc_id = acc.get("id", f"acc_{i}")
+        is_active = (acc_id == active_id)
+        active_tag = f"{CLR_GREEN}[* Active]{CLR_RESET}" if is_active else f"{CLR_DIM}          {CLR_RESET}"
+        disp_name = display_account_name(acc, show_email=show_email)
+        hits = acc.get("gen_count", acc.get("request_count", 0))
+        q = acc.get("last_quota", {})
+        g5_frac, _ = _display_quota_fractions(q)
+        g5_bar = render_progress_bar(g5_frac, width=8, compact=True) if g5_frac is not None else ""
+        quota_str = f"  Quota: {g5_bar}" if g5_bar else ""
+        hits_str = f"  Hits: {hits}" if hits else ""
+
+        is_hl = idx_0 in highlight_indices
+        if is_hl:
+            prefix = f"{CLR_CYAN}➜ [{i:>2}]{CLR_RESET}"
+            name_str = f"{CLR_BOLD}{CLR_CYAN}{disp_name}{CLR_RESET}"
+        else:
+            prefix = f"  [{i:>2}]"
+            name_str = f"{disp_name}"
+
+        print(f" {prefix} {active_tag} {name_str}{quota_str}{hits_str}")
+    print()
+
+
+def move_account(target, destination, show_email=None):
+    """
+    Moves an account to a new position in the pool.
+    Destination can be:
+      - 1-based index (1..N)
+      - 'top' / 'first' / 'head' / 'begin'
+      - 'bottom' / 'last' / 'tail' / 'end'
+      - 'up' / '-1' / '-N'
+      - 'down' / '+1' / '+N'
+      - another account index/name/ID (moves to that account's position)
+    """
+    if not target or destination is None:
+        print(f"{CLR_RED}[Error] Both target account and destination position must be specified.{CLR_RESET}")
+        print(f"Usage: agy-pool move <account> <position|top|bottom|up|down>")
+        return False
+
+    moved_info = {}
+
+    def do_move(pool):
+        accounts = pool.get("accounts", [])
+        if not accounts:
+            return "empty"
+        orig_idx = _resolve_account_index(target, accounts)
+        if orig_idx is None:
+            return "not_found"
+
+        n = len(accounts)
+        dest_str = str(destination).strip().lower()
+
+        if dest_str in ("top", "first", "head", "begin"):
+            dest_idx = 0
+        elif dest_str in ("bottom", "last", "tail", "end"):
+            dest_idx = n - 1
+        elif dest_str in ("up", "-1"):
+            dest_idx = max(0, orig_idx - 1)
+        elif dest_str in ("down", "+1"):
+            dest_idx = min(n - 1, orig_idx + 1)
+        elif dest_str.startswith("+") and dest_str[1:].isdigit():
+            dest_idx = min(n - 1, orig_idx + int(dest_str[1:]))
+        elif dest_str.startswith("-") and dest_str[1:].isdigit():
+            dest_idx = max(0, orig_idx - int(dest_str[1:]))
+        elif dest_str.isdigit():
+            d = int(dest_str)
+            if 1 <= d <= n:
+                dest_idx = d - 1
+            else:
+                return f"out_of_range:{d}:{n}"
+        else:
+            other_idx = _resolve_account_index(destination, accounts)
+            if other_idx is not None:
+                dest_idx = other_idx
+            else:
+                return f"invalid_dest:{destination}"
+
+        if orig_idx == dest_idx:
+            moved_info["same"] = True
+            moved_info["idx"] = orig_idx
+            moved_info["account"] = accounts[orig_idx]
+            return "same"
+
+        item = accounts.pop(orig_idx)
+        accounts.insert(dest_idx, item)
+        pool["accounts"] = accounts
+
+        active_id = pool.get("active_account_id")
+        if not active_id or not any(a.get("id") == active_id for a in accounts):
+            pool["active_account_id"] = accounts[0].get("id")
+
+        moved_info["orig_idx"] = orig_idx
+        moved_info["dest_idx"] = dest_idx
+        moved_info["account"] = item
+        moved_info["accounts"] = list(accounts)
+        moved_info["active_id"] = pool.get("active_account_id")
+        return "ok"
+
+    res = pool_transaction(do_move)
+    if res == "empty":
+        print(f"{CLR_RED}[Error] Account pool is empty.{CLR_RESET}")
+        return False
+    elif res == "not_found":
+        print(f"{CLR_RED}[Error] Account '{target}' not found.{CLR_RESET}")
+        return False
+    elif res == "same":
+        acc = moved_info["account"]
+        print(f"{CLR_YELLOW}Account {display_account_name(acc, show_email=show_email)} is already at position [{moved_info['idx'] + 1}].{CLR_RESET}")
+        return True
+    elif isinstance(res, str) and res.startswith("out_of_range:"):
+        _, d, n = res.split(":")
+        print(f"{CLR_RED}[Error] Destination position {d} is out of range. Must be between 1 and {n}.{CLR_RESET}")
+        return False
+    elif isinstance(res, str) and res.startswith("invalid_dest:"):
+        dest_val = res.split(":", 1)[1]
+        print(f"{CLR_RED}[Error] Invalid destination '{dest_val}'. Use a 1-based number (1..N) or top/bottom/up/down.{CLR_RESET}")
+        return False
+    elif res == "ok":
+        acc = moved_info["account"]
+        orig_1 = moved_info["orig_idx"] + 1
+        dest_1 = moved_info["dest_idx"] + 1
+        print(f"{CLR_GREEN}✓ Moved {CLR_BOLD}{display_account_name(acc, show_email=show_email)}{CLR_RESET}{CLR_GREEN} from position [{orig_1}] to [{dest_1}].{CLR_RESET}")
+        print_account_order_preview(moved_info["accounts"], highlight_indices=[moved_info["dest_idx"]], active_id=moved_info["active_id"], show_email=show_email)
+        return True
+    return False
+
+
+def swap_accounts(target1, target2, show_email=None):
+    """Swaps the positions of two accounts in the pool."""
+    if not target1 or not target2:
+        print(f"{CLR_RED}[Error] Two target accounts must be specified for swap.{CLR_RESET}")
+        print(f"Usage: agy-pool swap <account1> <account2>")
+        return False
+
+    swap_info = {}
+
+    def do_swap(pool):
+        accounts = pool.get("accounts", [])
+        if not accounts:
+            return "empty"
+        idx1 = _resolve_account_index(target1, accounts)
+        if idx1 is None:
+            return f"not_found:{target1}"
+        idx2 = _resolve_account_index(target2, accounts)
+        if idx2 is None:
+            return f"not_found:{target2}"
+
+        if idx1 == idx2:
+            swap_info["same"] = True
+            swap_info["idx"] = idx1
+            swap_info["account"] = accounts[idx1]
+            return "same"
+
+        accounts[idx1], accounts[idx2] = accounts[idx2], accounts[idx1]
+        pool["accounts"] = accounts
+
+        swap_info["idx1"] = idx1
+        swap_info["idx2"] = idx2
+        swap_info["acc1"] = accounts[idx2]  # now at idx2, originally at idx1
+        swap_info["acc2"] = accounts[idx1]  # now at idx1, originally at idx2
+        swap_info["accounts"] = list(accounts)
+        swap_info["active_id"] = pool.get("active_account_id")
+        return "ok"
+
+    res = pool_transaction(do_swap)
+    if res == "empty":
+        print(f"{CLR_RED}[Error] Account pool is empty.{CLR_RESET}")
+        return False
+    elif isinstance(res, str) and res.startswith("not_found:"):
+        t = res.split(":", 1)[1]
+        print(f"{CLR_RED}[Error] Account '{t}' not found.{CLR_RESET}")
+        return False
+    elif res == "same":
+        acc = swap_info["account"]
+        print(f"{CLR_YELLOW}Both targets refer to the same account: [{swap_info['idx'] + 1}] {display_account_name(acc, show_email=show_email)}.{CLR_RESET}")
+        return True
+    elif res == "ok":
+        acc1 = swap_info["acc1"]
+        acc2 = swap_info["acc2"]
+        i1 = swap_info["idx1"] + 1
+        i2 = swap_info["idx2"] + 1
+        print(f"{CLR_GREEN}✓ Swapped [{i1}] {CLR_BOLD}{display_account_name(acc2, show_email=show_email)}{CLR_RESET}{CLR_GREEN} ⇄ [{i2}] {CLR_BOLD}{display_account_name(acc1, show_email=show_email)}{CLR_RESET}")
+        print_account_order_preview(swap_info["accounts"], highlight_indices=[swap_info["idx1"], swap_info["idx2"]], active_id=swap_info["active_id"], show_email=show_email)
+        return True
+    return False
+
+
+def _natural_id_sort_key(acc):
+    acc_id = acc.get("id", "")
+    m = re.search(r'\d+', acc_id)
+    if m:
+        return (0, int(m.group()), acc_id)
+    return (1, 0, acc_id)
+
+
+def _account_status_rank(acc, now_ts=None):
+    if now_ts is None:
+        now_ts = time.time()
+    status = acc.get("status")
+    if status == "auth_error":
+        return 5
+    if status == "validation_required":
+        return 4
+    q = acc.get("last_quota", {})
+    g5_frac, gw_frac = _display_quota_fractions(q)
+    is_exhausted = any(f is not None and f <= 0.005 for f in (g5_frac, gw_frac))
+    if is_exhausted:
+        return 3
+    is_cooling = acc.get("rate_limited_until", 0) > now_ts
+    if is_cooling:
+        return 2
+    return 1
+
+
+def sort_pool(by="quota", reverse=False, refresh=False, show_email=None):
+    """
+    Sorts the entire account pool according to criteria:
+      - quota: Remaining quota fraction (default: highest first)
+      - hits / usage: Generation / request count (default: highest first)
+      - name: Friendly name / alias (default: A-Z)
+      - email: Email address (default: A-Z)
+      - status: Account health state (Ready -> Cooldown -> Exhausted -> Blocked)
+      - id: Account ID (default: numerical acc_1, acc_2...)
+      - created / time: Addition timestamp / order
+    """
+    criterion = (by or "quota").strip().lower()
+    valid_criteria = ("quota", "hits", "usage", "name", "email", "status", "id", "created", "time")
+    if criterion not in valid_criteria:
+        print(f"{CLR_RED}[Error] Unknown sort criterion '{by}'.{CLR_RESET}")
+        print(f"Available criteria: quota, hits, name, email, status, id, created")
+        return False
+
+    pool = load_pool()
+    accounts = pool.get("accounts", [])
+    if not accounts:
+        print(f"{CLR_RED}[Error] Account pool is empty.{CLR_RESET}")
+        return False
+
+    if refresh and criterion == "quota":
+        print(f"\n{CLR_BOLD}{CLR_CYAN}Refreshing quota for {len(accounts)} account(s)...{CLR_RESET}")
+        threads = []
+        for acc in accounts:
+            t = threading.Thread(target=lambda a: _safe_quota(a), args=(acc,))
+            threads.append(t)
+            t.start()
+        for t in threads:
+            t.join(timeout=8)
+        pool = load_pool()
+        accounts = pool.get("accounts", [])
+
+    now_ts = time.time()
+
+    def make_sort_key(acc):
+        if criterion == "quota":
+            q = acc.get("last_quota", {})
+            g5_frac, gw_frac = _display_quota_fractions(q)
+            g5 = g5_frac if g5_frac is not None else _get_remaining_fraction(acc)
+            gw = gw_frac if gw_frac is not None else 1.0
+            status = acc.get("status")
+            status_penalty = -1.0 if status in ("validation_required", "auth_error") else 0.0
+            hits = acc.get("gen_count", acc.get("request_count", 0))
+            return (status_penalty, g5, gw, -hits, _natural_id_sort_key(acc))
+        elif criterion in ("hits", "usage"):
+            hits = acc.get("gen_count", acc.get("request_count", 0))
+            q = acc.get("last_quota", {})
+            g5_frac, _ = _display_quota_fractions(q)
+            frac = g5_frac if g5_frac is not None else _get_remaining_fraction(acc)
+            return (hits, frac, _natural_id_sort_key(acc))
+        elif criterion == "name":
+            name = (acc.get("name") or display_account_name(acc, show_email=show_email) or "").strip().lower()
+            return (name, _natural_id_sort_key(acc))
+        elif criterion == "email":
+            email = (acc.get("email") or "").strip().lower()
+            return (email, _natural_id_sort_key(acc))
+        elif criterion == "status":
+            rank = _account_status_rank(acc, now_ts)
+            q = acc.get("last_quota", {})
+            g5_frac, _ = _display_quota_fractions(q)
+            frac = g5_frac if g5_frac is not None else _get_remaining_fraction(acc)
+            hits = acc.get("gen_count", acc.get("request_count", 0))
+            return (rank, -frac, hits, _natural_id_sort_key(acc))
+        elif criterion == "id":
+            return _natural_id_sort_key(acc)
+        elif criterion in ("created", "time"):
+            ts = acc.get("created_at") or acc.get("added_at") or acc.get("updated_at")
+            if ts:
+                return (0, ts, _natural_id_sort_key(acc))
+            return (1, 0, _natural_id_sort_key(acc))
+        return (0,)
+
+    if criterion in ("quota", "hits", "usage"):
+        is_reverse = not reverse
+    else:
+        is_reverse = reverse
+
+    sorted_info = {}
+
+    def do_sort(p):
+        accs = p.get("accounts", [])
+        if not accs:
+            return "empty"
+        sorted_accs = sorted(accs, key=make_sort_key, reverse=is_reverse)
+        p["accounts"] = sorted_accs
+
+        active_id = p.get("active_account_id")
+        if not active_id or not any(a.get("id") == active_id for a in sorted_accs):
+            p["active_account_id"] = sorted_accs[0].get("id")
+
+        sorted_info["accounts"] = list(sorted_accs)
+        sorted_info["active_id"] = p.get("active_account_id")
+        return "ok"
+
+    res = pool_transaction(do_sort)
+    if res == "ok":
+        order_desc = "descending" if is_reverse else "ascending"
+        rev_tag = " (reversed)" if reverse else ""
+        print(f"{CLR_GREEN}✓ Sorted account pool by {CLR_BOLD}{criterion}{CLR_RESET}{CLR_GREEN} ({order_desc}{rev_tag}).{CLR_RESET}")
+        print_account_order_preview(sorted_info["accounts"], active_id=sorted_info["active_id"], show_email=show_email)
+        return True
+    return False
+
+
+def reorder_pool(order_args, show_email=None):
+    """
+    Reorders the account pool:
+      - If no args: displays current order and usage guide.
+      - If 2 args (and total accounts > 2 or arg2 is relative): moves target to destination.
+      - If full list of positions / IDs: applies exact permutation.
+    """
+    pool = load_pool()
+    accounts = pool.get("accounts", [])
+    if not accounts:
+        print(f"{CLR_RED}[Error] Account pool is empty.{CLR_RESET}")
+        return False
+
+    flattened = []
+    if order_args:
+        for a in order_args:
+            for part in str(a).replace(",", " ").split():
+                if part:
+                    flattened.append(part)
+
+    if not flattened:
+        print(f"{CLR_CYAN}Current Account Pool Order:{CLR_RESET}")
+        print_account_order_preview(accounts, active_id=pool.get("active_account_id"), show_email=show_email)
+        print(f"{CLR_BOLD}Usage:{CLR_RESET}")
+        print(f"  agy-pool move <account> <position|top|bottom|up|down>  (Move single account)")
+        print(f"  agy-pool swap <account1> <account2>                   (Swap two accounts)")
+        print(f"  agy-pool sort [quota|hits|name|email|status|id] [-r]   (Sort pool by criteria)")
+        print(f"  agy-pool reorder <pos1> <pos2> ... <posN>             (Custom batch reordering)")
+        return True
+
+    # If exactly 2 arguments and either len(accounts) > 2 or arg2 is a relative keyword:
+    if len(flattened) == 2 and (len(accounts) != 2 or flattened[1].lower() in ("top", "bottom", "up", "down", "first", "last")):
+        return move_account(flattened[0], flattened[1], show_email=show_email)
+
+    n = len(accounts)
+    if len(flattened) != n:
+        print(f"{CLR_RED}[Error] Reorder sequence count ({len(flattened)}) does not match pool account count ({n}).{CLR_RESET}")
+        print(f"You must specify all {n} accounts in the desired order.")
+        print(f"Example: agy-pool reorder {' '.join(str(i) for i in reversed(range(1, n + 1)))}")
+        return False
+
+    resolved_indices = []
+    seen = set()
+    for item in flattened:
+        idx = _resolve_account_index(item, accounts)
+        if idx is None:
+            print(f"{CLR_RED}[Error] Account '{item}' not found or invalid.{CLR_RESET}")
+            return False
+        if idx in seen:
+            acc = accounts[idx]
+            print(f"{CLR_RED}[Error] Duplicate account specified in reorder sequence: [{idx + 1}] {display_account_name(acc, show_email=show_email)}.{CLR_RESET}")
+            return False
+        seen.add(idx)
+        resolved_indices.append(idx)
+
+    reordered_info = {}
+
+    def do_reorder(p):
+        accs = p.get("accounts", [])
+        if len(accs) != n:
+            return "pool_changed"
+        new_accs = [accs[i] for i in resolved_indices]
+        p["accounts"] = new_accs
+
+        active_id = p.get("active_account_id")
+        if not active_id or not any(a.get("id") == active_id for a in new_accs):
+            p["active_account_id"] = new_accs[0].get("id")
+
+        reordered_info["accounts"] = list(new_accs)
+        reordered_info["active_id"] = p.get("active_account_id")
+        return "ok"
+
+    res = pool_transaction(do_reorder)
+    if res == "pool_changed":
+        print(f"{CLR_RED}[Error] Account pool changed during reorder. Please retry.{CLR_RESET}")
+        return False
+    elif res == "ok":
+        print(f"{CLR_GREEN}✓ Reordered all {n} accounts successfully.{CLR_RESET}")
+        print_account_order_preview(reordered_info["accounts"], active_id=reordered_info["active_id"], show_email=show_email)
+        return True
+    return False
 
 
 def switch_account(target=None, silent=False):
@@ -1619,11 +2061,9 @@ def switch_account(target=None, silent=False):
                 return (1, acc.get("last_quota", {}).get("remaining_fraction", 0.0))
             choices = sorted(choices, key=auto_sort_key, reverse=True)
             selected = choices[0] if choices else None
-        elif target.isdigit():
-            idx = int(target) - 1
-            selected = choices[idx] if 0 <= idx < len(choices) else None
         else:
-            selected = next((a for a in choices if a.get("id") == target or a.get("email") == target or a.get("name") == target), None)
+            idx = _resolve_account_index(target, choices)
+            selected = choices[idx] if idx is not None else None
         if selected:
             pool["active_account_id"] = selected["id"]
             return dict(selected)
@@ -1665,17 +2105,10 @@ def do_verify(target=None):
     target_acc = None
     target_idx = None
     if target is not None:
-        if str(target).isdigit():
-            idx = int(target) - 1
-            if 0 <= idx < len(accounts):
-                target_acc = accounts[idx]
-                target_idx = idx + 1
-        else:
-            for idx, a in enumerate(accounts):
-                if a.get("id") == target or a.get("email") == target or a.get("name") == target:
-                    target_acc = a
-                    target_idx = idx + 1
-                    break
+        idx = _resolve_account_index(target, accounts)
+        if idx is not None:
+            target_acc = accounts[idx]
+            target_idx = idx + 1
     else:
         # Auto-find first account needing verification
         for idx, a in enumerate(accounts):
@@ -4538,6 +4971,11 @@ def main():
         epilog="""Examples:
   agy-pool login            Add/login a new Google account
   agy-pool list             Refresh and show cached account quotas
+  agy-pool move 5 1         Move account [5] to position [1] (or 'move 5 top')
+  agy-pool swap 1 2         Swap positions of accounts [1] and [2]
+  agy-pool sort quota       Sort accounts by remaining quota (highest first)
+  agy-pool sort hits -r     Sort accounts by usage hits (least used first)
+  agy-pool reorder 3 1 2    Batch reorder accounts to exact sequence
   agy-pool switch auto      Switch active account to the one with highest quota
   agy-pool export           Export accounts pool to a backup JSON file
   agy-pool import file.json Restore accounts pool from a backup file
@@ -4567,6 +5005,30 @@ def main():
     ren_p = subparsers.add_parser("rename", aliases=["alias", "name"], help="Set or update a friendly display name / alias for an account")
     ren_p.add_argument("target", help="Account index, name, or email")
     ren_p.add_argument("new_name", nargs="?", default="", help="New friendly display name for the account (omit to clear)")
+    # move / mv
+    move_p = subparsers.add_parser("move", aliases=["mv"], help="Move an account to a new position (top, bottom, up, down, or index)")
+    move_p.add_argument("target", help="Account index (1-based), ID, name, or email")
+    move_p.add_argument("destination", help="Target position (1-based index, or top, bottom, up, down)")
+    move_p.add_argument("--show-email", dest="show_email", action="store_true", default=None, help="Display real email addresses")
+    move_p.add_argument("--hide-email", dest="show_email", action="store_false", help="Hide real email addresses")
+    # swap
+    swap_p = subparsers.add_parser("swap", help="Swap the positions of two accounts in the pool")
+    swap_p.add_argument("target1", help="First account index (1-based), ID, name, or email")
+    swap_p.add_argument("target2", help="Second account index (1-based), ID, name, or email")
+    swap_p.add_argument("--show-email", dest="show_email", action="store_true", default=None, help="Display real email addresses")
+    swap_p.add_argument("--hide-email", dest="show_email", action="store_false", help="Hide real email addresses")
+    # sort
+    sort_p = subparsers.add_parser("sort", help="Sort account pool by criteria (quota, hits, name, email, status, id, created)")
+    sort_p.add_argument("by", nargs="?", default="quota", choices=["quota", "hits", "usage", "name", "email", "status", "id", "created", "time"], help="Sort criterion (default: quota)")
+    sort_p.add_argument("-r", "--reverse", action="store_true", help="Reverse the sort order")
+    sort_p.add_argument("--refresh", action="store_true", help="Refresh quotas before sorting")
+    sort_p.add_argument("--show-email", dest="show_email", action="store_true", default=None, help="Display real email addresses")
+    sort_p.add_argument("--hide-email", dest="show_email", action="store_false", help="Hide real email addresses")
+    # reorder / order
+    reo_p = subparsers.add_parser("reorder", aliases=["order"], help="Batch reorder accounts or display ordering guide")
+    reo_p.add_argument("sequence", nargs="*", help="Desired sequence of account indices / names (or leave empty for guide)")
+    reo_p.add_argument("--show-email", dest="show_email", action="store_true", default=None, help="Display real email addresses")
+    reo_p.add_argument("--hide-email", dest="show_email", action="store_false", help="Hide real email addresses")
     # switch
     sw_p = subparsers.add_parser("switch", help="Switch current active account (auto or index/name/email)")
     sw_p.add_argument("target", nargs="?", default="auto", help="Account index, name, email, or 'auto'")
@@ -4644,6 +5106,14 @@ def main():
         remove_account(args.target)
     elif cmd in ["rename", "alias", "name"]:
         rename_account(args.target, args.new_name)
+    elif cmd in ["move", "mv"]:
+        move_account(args.target, args.destination, show_email=getattr(args, "show_email", None))
+    elif cmd == "swap":
+        swap_accounts(args.target1, args.target2, show_email=getattr(args, "show_email", None))
+    elif cmd == "sort":
+        sort_pool(by=args.by, reverse=args.reverse, refresh=args.refresh, show_email=getattr(args, "show_email", None))
+    elif cmd in ["reorder", "order"]:
+        reorder_pool(args.sequence, show_email=getattr(args, "show_email", None))
     elif cmd == "switch":
         switch_account(args.target)
     elif cmd in ["export", "backup"]:

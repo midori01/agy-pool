@@ -2935,6 +2935,272 @@ class AgyPoolTest(unittest.TestCase):
             t.join(timeout=2.0)
             mock_sq.assert_called_once()
 
+    def test_resolve_account_index(self):
+        acc1 = account("acc_1")
+        acc1["email"] = "alice@example.com"
+        acc1["name"] = "Alice"
+        acc2 = account("acc_2")
+        acc2["email"] = "bob@example.com"
+        acc2["name"] = "Bob"
+        acc3 = account("acc_10")
+        acc3["email"] = "charlie@example.com"
+        acc3["name"] = "Charlie"
+        accs = [acc1, acc2, acc3]
+
+        # 1-based index
+        self.assertEqual(agy_pool._resolve_account_index("1", accs), 0)
+        self.assertEqual(agy_pool._resolve_account_index("2", accs), 1)
+        self.assertEqual(agy_pool._resolve_account_index("3", accs), 2)
+        self.assertIsNone(agy_pool._resolve_account_index("4", accs))
+        self.assertIsNone(agy_pool._resolve_account_index("0", accs))
+
+        # By ID
+        self.assertEqual(agy_pool._resolve_account_index("acc_1", accs), 0)
+        self.assertEqual(agy_pool._resolve_account_index("acc_10", accs), 2)
+
+        # By exact email
+        self.assertEqual(agy_pool._resolve_account_index("alice@example.com", accs), 0)
+
+        # By case-insensitive name
+        self.assertEqual(agy_pool._resolve_account_index("alice", accs), 0)
+        self.assertEqual(agy_pool._resolve_account_index("BOB", accs), 1)
+
+        # By unique substring
+        self.assertEqual(agy_pool._resolve_account_index("char", accs), 2)
+
+        # Non-existent or empty
+        self.assertIsNone(agy_pool._resolve_account_index("david", accs))
+        self.assertIsNone(agy_pool._resolve_account_index(None, accs))
+        self.assertIsNone(agy_pool._resolve_account_index("1", []))
+
+    def test_move_account(self):
+        acc1 = account("acc_1")
+        acc1["name"] = "Alice"
+        acc2 = account("acc_2")
+        acc2["name"] = "Bob"
+        acc3 = account("acc_3")
+        acc3["name"] = "Charlie"
+        self.save_accounts([acc1, acc2, acc3], active="acc_1")
+
+        # Move Charlie (3) to top (1)
+        buf = io.StringIO()
+        with mock.patch("sys.stdout", buf):
+            self.assertTrue(agy_pool.move_account("3", "top"))
+        pool = agy_pool.load_pool()
+        self.assertEqual([a["id"] for a in pool["accounts"]], ["acc_3", "acc_1", "acc_2"])
+        self.assertEqual(pool["active_account_id"], "acc_1")
+
+        # Move Charlie (now at 1) to bottom
+        with mock.patch("sys.stdout", io.StringIO()):
+            self.assertTrue(agy_pool.move_account("acc_3", "bottom"))
+        pool = agy_pool.load_pool()
+        self.assertEqual([a["id"] for a in pool["accounts"]], ["acc_1", "acc_2", "acc_3"])
+
+        # Move Bob (2) up -> position 1
+        with mock.patch("sys.stdout", io.StringIO()):
+            self.assertTrue(agy_pool.move_account("Bob", "up"))
+        pool = agy_pool.load_pool()
+        self.assertEqual([a["id"] for a in pool["accounts"]], ["acc_2", "acc_1", "acc_3"])
+
+        # Move Bob (now at 1) down -> position 2
+        with mock.patch("sys.stdout", io.StringIO()):
+            self.assertTrue(agy_pool.move_account("1", "down"))
+        pool = agy_pool.load_pool()
+        self.assertEqual([a["id"] for a in pool["accounts"]], ["acc_1", "acc_2", "acc_3"])
+
+        # Move to exact 1-based index (e.g. 1 to 3)
+        with mock.patch("sys.stdout", io.StringIO()):
+            self.assertTrue(agy_pool.move_account("1", "3"))
+        pool = agy_pool.load_pool()
+        self.assertEqual([a["id"] for a in pool["accounts"]], ["acc_2", "acc_3", "acc_1"])
+
+        # Move to position of another account (move Charlie to Bob's position)
+        with mock.patch("sys.stdout", io.StringIO()):
+            self.assertTrue(agy_pool.move_account("Charlie", "Bob"))
+        pool = agy_pool.load_pool()
+        self.assertEqual([a["id"] for a in pool["accounts"]], ["acc_3", "acc_2", "acc_1"])
+
+        # Same position no-op
+        with mock.patch("sys.stdout", io.StringIO()):
+            self.assertTrue(agy_pool.move_account("1", "1"))
+
+        # Invalid target
+        with mock.patch("sys.stdout", io.StringIO()):
+            self.assertFalse(agy_pool.move_account("99", "1"))
+
+        # Out of range destination
+        with mock.patch("sys.stdout", io.StringIO()):
+            self.assertFalse(agy_pool.move_account("1", "10"))
+
+        # Invalid destination keyword
+        with mock.patch("sys.stdout", io.StringIO()):
+            self.assertFalse(agy_pool.move_account("1", "invalid_keyword"))
+
+    def test_swap_accounts(self):
+        acc1 = account("acc_1")
+        acc1["name"] = "Alice"
+        acc2 = account("acc_2")
+        acc2["name"] = "Bob"
+        acc3 = account("acc_3")
+        acc3["name"] = "Charlie"
+        self.save_accounts([acc1, acc2, acc3], active="acc_2")
+
+        # Swap 1 and 3
+        with mock.patch("sys.stdout", io.StringIO()):
+            self.assertTrue(agy_pool.swap_accounts("1", "3"))
+        pool = agy_pool.load_pool()
+        self.assertEqual([a["id"] for a in pool["accounts"]], ["acc_3", "acc_2", "acc_1"])
+        self.assertEqual(pool["active_account_id"], "acc_2")
+
+        # Swap by name
+        with mock.patch("sys.stdout", io.StringIO()):
+            self.assertTrue(agy_pool.swap_accounts("Alice", "Bob"))
+        pool = agy_pool.load_pool()
+        self.assertEqual([a["id"] for a in pool["accounts"]], ["acc_3", "acc_1", "acc_2"])
+
+        # Swap same account
+        with mock.patch("sys.stdout", io.StringIO()):
+            self.assertTrue(agy_pool.swap_accounts("1", "1"))
+
+        # Target not found
+        with mock.patch("sys.stdout", io.StringIO()):
+            self.assertFalse(agy_pool.swap_accounts("1", "99"))
+            self.assertFalse(agy_pool.swap_accounts("99", "1"))
+
+    def test_sort_pool(self):
+        acc1 = account("acc_1")
+        acc1["name"] = "Charlie"
+        acc1["email"] = "c@example.com"
+        acc1["gen_count"] = 5
+        acc1["last_quota"] = {"remaining_fraction": 0.3, "gemini_5h": {"fraction": 0.3}}
+
+        acc2 = account("acc_2")
+        acc2["name"] = "Alice"
+        acc2["email"] = "a@example.com"
+        acc2["gen_count"] = 20
+        acc2["last_quota"] = {"remaining_fraction": 0.9, "gemini_5h": {"fraction": 0.9}}
+
+        acc3 = account("acc_10")
+        acc3["name"] = "Bob"
+        acc3["email"] = "b@example.com"
+        acc3["gen_count"] = 10
+        acc3["last_quota"] = {"remaining_fraction": 0.6, "gemini_5h": {"fraction": 0.6}}
+
+        self.save_accounts([acc1, acc2, acc3])
+
+        # Sort by quota (highest first by default)
+        with mock.patch("sys.stdout", io.StringIO()):
+            self.assertTrue(agy_pool.sort_pool(by="quota"))
+        pool = agy_pool.load_pool()
+        self.assertEqual([a["id"] for a in pool["accounts"]], ["acc_2", "acc_10", "acc_1"])
+
+        # Sort by quota reverse (lowest first)
+        with mock.patch("sys.stdout", io.StringIO()):
+            self.assertTrue(agy_pool.sort_pool(by="quota", reverse=True))
+        pool = agy_pool.load_pool()
+        self.assertEqual([a["id"] for a in pool["accounts"]], ["acc_1", "acc_10", "acc_2"])
+
+        # Sort by hits (highest hits first by default)
+        with mock.patch("sys.stdout", io.StringIO()):
+            self.assertTrue(agy_pool.sort_pool(by="hits"))
+        pool = agy_pool.load_pool()
+        self.assertEqual([a["id"] for a in pool["accounts"]], ["acc_2", "acc_10", "acc_1"])
+
+        # Sort by hits reverse (least hits first)
+        with mock.patch("sys.stdout", io.StringIO()):
+            self.assertTrue(agy_pool.sort_pool(by="hits", reverse=True))
+        pool = agy_pool.load_pool()
+        self.assertEqual([a["id"] for a in pool["accounts"]], ["acc_1", "acc_10", "acc_2"])
+
+        # Sort by name (A-Z)
+        with mock.patch("sys.stdout", io.StringIO()):
+            self.assertTrue(agy_pool.sort_pool(by="name"))
+        pool = agy_pool.load_pool()
+        self.assertEqual([a["name"] for a in pool["accounts"]], ["Alice", "Bob", "Charlie"])
+
+        # Sort by email (A-Z)
+        with mock.patch("sys.stdout", io.StringIO()):
+            self.assertTrue(agy_pool.sort_pool(by="email"))
+        pool = agy_pool.load_pool()
+        self.assertEqual([a["email"] for a in pool["accounts"]], ["a@example.com", "b@example.com", "c@example.com"])
+
+        # Sort by natural ID (acc_1, acc_2, acc_10)
+        with mock.patch("sys.stdout", io.StringIO()):
+            self.assertTrue(agy_pool.sort_pool(by="id"))
+        pool = agy_pool.load_pool()
+        self.assertEqual([a["id"] for a in pool["accounts"]], ["acc_1", "acc_2", "acc_10"])
+
+        # Unknown criterion
+        with mock.patch("sys.stdout", io.StringIO()):
+            self.assertFalse(agy_pool.sort_pool(by="unknown_criterion"))
+
+    def test_reorder_pool(self):
+        acc1 = account("acc_1")
+        acc2 = account("acc_2")
+        acc3 = account("acc_3")
+        self.save_accounts([acc1, acc2, acc3], active="acc_2")
+
+        # No args prints guide
+        buf = io.StringIO()
+        with mock.patch("sys.stdout", buf):
+            self.assertTrue(agy_pool.reorder_pool([]))
+        self.assertIn("Current Account Pool Order", buf.getvalue())
+
+        # Exact permutation
+        with mock.patch("sys.stdout", io.StringIO()):
+            self.assertTrue(agy_pool.reorder_pool(["3", "1", "2"]))
+        pool = agy_pool.load_pool()
+        self.assertEqual([a["id"] for a in pool["accounts"]], ["acc_3", "acc_1", "acc_2"])
+
+        # Comma separated permutation (reverting back to 1, 2, 3)
+        with mock.patch("sys.stdout", io.StringIO()):
+            self.assertTrue(agy_pool.reorder_pool(["2, 3, 1"]))
+        pool = agy_pool.load_pool()
+        self.assertEqual([a["id"] for a in pool["accounts"]], ["acc_1", "acc_2", "acc_3"])
+
+        # Count mismatch
+        with mock.patch("sys.stdout", io.StringIO()):
+            self.assertFalse(agy_pool.reorder_pool(["1", "2", "3", "4"]))
+
+        # Duplicate account in sequence
+        with mock.patch("sys.stdout", io.StringIO()):
+            self.assertFalse(agy_pool.reorder_pool(["1", "1", "3"]))
+
+        # Invalid account in sequence
+        with mock.patch("sys.stdout", io.StringIO()):
+            self.assertFalse(agy_pool.reorder_pool(["1", "99", "3"]))
+
+    def test_cli_reordering_commands(self):
+        acc1 = account("acc_1")
+        acc1["name"] = "Alice"
+        acc2 = account("acc_2")
+        acc2["name"] = "Bob"
+        self.save_accounts([acc1, acc2])
+
+        with mock.patch("sys.stdout", io.StringIO()), \
+             mock.patch("sys.argv", ["agy-pool", "swap", "1", "2"]):
+            agy_pool.main()
+        pool = agy_pool.load_pool()
+        self.assertEqual([a["id"] for a in pool["accounts"]], ["acc_2", "acc_1"])
+
+        with mock.patch("sys.stdout", io.StringIO()), \
+             mock.patch("sys.argv", ["agy-pool", "move", "2", "1"]):
+            agy_pool.main()
+        pool = agy_pool.load_pool()
+        self.assertEqual([a["id"] for a in pool["accounts"]], ["acc_1", "acc_2"])
+
+        with mock.patch("sys.stdout", io.StringIO()), \
+             mock.patch("sys.argv", ["agy-pool", "sort", "id", "-r"]):
+            agy_pool.main()
+        pool = agy_pool.load_pool()
+        self.assertEqual([a["id"] for a in pool["accounts"]], ["acc_2", "acc_1"])
+
+        with mock.patch("sys.stdout", io.StringIO()), \
+             mock.patch("sys.argv", ["agy-pool", "reorder", "2", "1"]):
+            agy_pool.main()
+        pool = agy_pool.load_pool()
+        self.assertEqual([a["id"] for a in pool["accounts"]], ["acc_1", "acc_2"])
+
 
 if __name__ == "__main__":
     unittest.main()

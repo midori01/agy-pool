@@ -68,6 +68,10 @@ The installer validates Python 3, sets up symlinks (`agy-pool`, `agy-raw`), conf
 | `agy-pool switch <ID>` | Manually switch active account (e.g. `agy-pool switch 2`) |
 | `agy-pool verify [ID]` | Open Cloud Code security challenge verification flow in browser |
 | `agy-pool rename <ID> [name]` | Set, update, or clear a friendly display name/alias for an account |
+| `agy-pool move <ID> <pos>` | Move account to position (`1..N`, `top`, `bottom`, `up`, `down`) (`mv`) |
+| `agy-pool swap <A> <B>` | Swap positions of two accounts in the pool |
+| `agy-pool sort [criteria]` | Sort pool by `quota`, `hits`, `name`, `email`, `status`, `id` (`-r` reverse) |
+| `agy-pool reorder [seq]` | Custom batch reordering or display ordering guide (`order`) |
 | `agy-pool remove <ID>` | Remove an account from the pool |
 | `agy-pool start / stop` | Manage the background gateway daemon (`127.0.0.1:8899`) |
 | `agy-pool log [-f]` | Inspect or follow proxy daemon log (`--rotate`, `--clear`) |
