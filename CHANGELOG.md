@@ -5,6 +5,25 @@ All notable changes to the `agy-pool` project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.0-beta.7] - 2026-09-26
+
+### Added
+- **Account Reordering, Moving & Multi-Criteria Sorting (`move`, `swap`, `sort`, `reorder`)**:
+  - Implemented `move` (alias `mv`): Move a single account to any absolute position (1-based index `1..N`), relative target (`top`, `bottom`, `up`, `down`, `+N`, `-N`), or another account's position.
+  - Implemented `swap`: Atomically swap positions between any two accounts in the pool.
+  - Implemented `sort`: Multi-criteria pool sorting with optional `-r`/`--reverse` and `--refresh`:
+    - `quota` (default): Remaining Gemini quota fraction (highest quota first).
+    - `hits` / `usage`: Generation / request count (highest usage first).
+    - `name` / `email`: Case-insensitive alphabetical dictionary sorting.
+    - `status`: Health state tiering (Ready/Active -> Cooldown -> Exhausted -> Blocked).
+    - `id`: Natural numerical sorting (`acc_1`, `acc_2`, ..., `acc_10`).
+    - `created` / `time`: Addition order and timestamp.
+  - Implemented `reorder` (alias `order`): Custom sequence batch reordering with interactive ordering guide and two-argument move fallback.
+  - Added clean visual preview (`print_account_order_preview`) rendering `➜` and cyan ANSI highlights on moved/swapped rows, active account markers (`[* Active]`), compact progress bars, and hits.
+  - Added `_resolve_account_index` unifying target resolution across `move`, `swap`, `sort`, `reorder`, `remove`, `rename`, `switch`, `do_verify`, and `list_accounts` (supporting 1-based index, ID, exact email/name, case-insensitive match, and unique substring).
+  - Preserved concurrency invariants: all mutations protected under `pool_transaction` with file locks; active account pointer and round-robin cursor remain stable and undisturbed.
+  - Added 6 comprehensive automated test suites bringing total unit tests to 119/119 (100% pass rate on both Termux and macOS).
+
 ## [0.1.0-beta.6] - 2026-09-26
 
 ### Fixed
