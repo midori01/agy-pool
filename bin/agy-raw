@@ -1,4 +1,4 @@
-#!/usr/bin/env bash
+#!/bin/sh
 # agy-raw: Directly execute original native Antigravity CLI without proxy gateway
 unset CLOUD_CODE_URL
 
@@ -16,7 +16,7 @@ for cand in \
     "/usr/local/bin/agy" \
     "/usr/bin/agy" \
     "$HOME/.local/bin/agy" \
-    "$(type -P agy 2>/dev/null || true)"; do
+    "$(command -v agy 2>/dev/null || type -P agy 2>/dev/null || true)"; do
     if [ -n "$cand" ] && [ -x "$cand" ]; then
         cand_real="$(realpath "$cand" 2>/dev/null || readlink -f "$cand" 2>/dev/null || echo "$cand")"
         if [ "$cand_real" != "$SELF" ]; then

@@ -1,4 +1,5 @@
-#!/usr/bin/env python3
+#!/bin/sh
+"exec" "python3" "$0" "$@"
 # -*- coding: utf-8 -*-
 """
 agy-pool: Antigravity Multi-Account Pool & Load Balancer for Termux
