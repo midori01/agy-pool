@@ -11,6 +11,7 @@ import io
 import json
 import multiprocessing
 import os
+import shutil
 import socket
 import sqlite3
 import subprocess
@@ -20,7 +21,19 @@ import time
 import unittest
 import urllib.error
 import urllib.parse
+import urllib.request
 from unittest import mock
+
+# Ensure loopback addresses bypass any environment or system proxies during test runs
+_orig_test_proxy_bypass = urllib.request.proxy_bypass
+
+def _safe_test_proxy_bypass(host):
+    h = host.split(":")[0].strip().lower()
+    if h in ("127.0.0.1", "localhost", "::1", "0.0.0.0") or h.startswith("127."):
+        return True
+    return _orig_test_proxy_bypass(host)
+
+urllib.request.proxy_bypass = _safe_test_proxy_bypass
 
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -1199,7 +1212,7 @@ class AgyPoolTest(unittest.TestCase):
             fake_pw = mock.Mock(pw_dir="/home/mockuser")
             with mock.patch("pwd.getpwuid", return_value=fake_pw):
                 mock_detected = agy_pool._detect_real_production_gemini_dir()
-                self.assertEqual(mock_detected, "/home/mockuser/.gemini")
+                self.assertEqual(mock_detected, os.path.realpath("/home/mockuser/.gemini"))
 
         # Fallback when pwd is unavailable
         with mock.patch.dict(os.environ, {"HOME": "/home/fallbackuser"}, clear=False), \
@@ -1289,8 +1302,10 @@ class AgyPoolTest(unittest.TestCase):
             json.dump({"version": 1, "accounts": [{"id": "acc_keep", "email": "keep@example.com"}]}, f)
 
         repo_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        install_script = os.path.join(repo_dir, "install.sh")
-        uninstall_script = os.path.join(repo_dir, "uninstall.sh")
+        fixture_dir = os.path.join(self.temp.name, "repo")
+        shutil.copytree(repo_dir, fixture_dir, ignore=shutil.ignore_patterns(".git", "__pycache__", "*.pyc"))
+        install_script = os.path.join(fixture_dir, "install.sh")
+        uninstall_script = os.path.join(fixture_dir, "uninstall.sh")
 
         env = dict(os.environ, HOME=fake_home, PREFIX=fake_prefix)
         # 1. Fresh install

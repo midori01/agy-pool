@@ -23,10 +23,10 @@ rm -f "$TARGET_DIR/agy-pool" "$TARGET_DIR/agy-raw" "$TARGET_DIR/agy-orig"
 rm -f "$HOME/.local/bin/agy-pool" "$HOME/.local/bin/agy-raw" "$HOME/.local/bin/agy-orig" 2>/dev/null || true
 echo -e "\033[32m[✓] Removed agy-pool binaries and symlinks\033[0m"
 
-# 3. Clean ~/.bashrc and ~/.zshrc
-for rc in "$HOME/.bashrc" "$HOME/.zshrc"; do
+# 3. Clean ~/.bashrc, ~/.zshrc, ~/.zprofile, and ~/.bash_profile
+for rc in "$HOME/.bashrc" "$HOME/.zshrc" "$HOME/.zprofile" "$HOME/.bash_profile"; do
     if [ -f "$rc" ]; then
-        sed -i '/# >>> agy-pool integration >>>/,/# <<< agy-pool integration <<</d' "$rc" 2>/dev/null || true
+        sed -i.bak '/# >>> agy-pool integration >>>/,/# <<< agy-pool integration <<</d' "$rc" 2>/dev/null && rm -f "$rc.bak" || true
         echo -e "\033[32m[✓] Cleaned agy-pool alias from $rc\033[0m"
     fi
 done

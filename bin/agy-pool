@@ -1,4 +1,4 @@
-#!/data/data/com.termux/files/usr/bin/env python3
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
 agy-pool: Antigravity Multi-Account Pool & Load Balancer for Termux
@@ -18,6 +18,18 @@ import shutil
 import urllib.request
 import urllib.parse
 import urllib.error
+
+# Ensure localhost and loopback addresses always bypass HTTP/HTTPS proxies across all platforms
+# (particularly on macOS where SystemConfiguration proxy settings may lack explicit loopback exceptions).
+_orig_proxy_bypass = urllib.request.proxy_bypass
+
+def _loopback_aware_proxy_bypass(host):
+    h = host.split(":")[0].strip().lower()
+    if h in ("127.0.0.1", "localhost", "::1", "0.0.0.0") or h.startswith("127."):
+        return True
+    return _orig_proxy_bypass(host)
+
+urllib.request.proxy_bypass = _loopback_aware_proxy_bypass
 import ssl
 import http.server
 import socketserver
@@ -52,7 +64,7 @@ except ImportError:
     HAS_TERMIOS = False
 
 # ----------------- Constants & Configuration -----------------
-VERSION = "0.1.0-beta.5"
+VERSION = "0.1.0-beta.6"
 QUOTA_FRESH_MAX_AGE = 60
 QUOTA_AGING_MAX_AGE = 300
 _QUOTA_REFRESH_LOCK = threading.Lock()
@@ -4280,6 +4292,14 @@ def get_daemon_info():
                 cmd = f.read().decode(errors="ignore")
                 if "agy-pool" not in cmd and "python" not in cmd:
                     return None
+        elif sys.platform == "darwin":
+            try:
+                res = subprocess.run(["ps", "-p", str(pid), "-o", "command="], capture_output=True, text=True, timeout=1)
+                cmd = res.stdout.strip().lower()
+                if cmd and "agy-pool" not in cmd and "python" not in cmd:
+                    return None
+            except Exception:
+                pass
         return {"pid": pid, "version": version, "script_mtime": script_mtime}
     except Exception:
         return None

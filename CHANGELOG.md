@@ -5,6 +5,19 @@ All notable changes to the `agy-pool` project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.0-beta.6] - 2026-09-26
+
+### Fixed
+- **macOS & BSD Cross-Platform Compatibility**:
+  - Restored standard POSIX shebangs (`#!/usr/bin/env python3` and `#!/usr/bin/env bash`) across `agy-pool` and `agy-raw`.
+  - Implemented loopback-aware proxy bypass ensuring internal health endpoints (`/_agy_pool/stats`) and local test upstream handlers never route through system HTTP/HTTPS proxies (such as Clash/Surge on macOS).
+  - Added case-insensitive process commandline inspection via `ps` on macOS when `/proc` is absent.
+  - Fixed BSD `sed -i` syntax errors in `install.sh` and `uninstall.sh` using a portable backup-and-remove pattern.
+  - Added shell profile configuration support for `~/.zprofile` and `~/.bash_profile` for macOS login shells.
+  - Isolated installer lifecycle unit tests to temporary fixtures to eliminate accidental git repository working tree modifications.
+  - Resolved macOS `/home` firmlink symlink resolution discrepancy in production directory detection tests.
+  - 100% test pass rate (113/113 tests) verified on both Android Termux and macOS Darwin.
+
 ## [0.1.0-beta.5] - 2026-09-19
 
 ### Added

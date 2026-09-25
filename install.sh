@@ -129,16 +129,27 @@ install_deps
 
 # 3. Shebang adjustment and executable permissions
 chmod +x "$BIN_SRC" "$RAW_SRC"
+
+run_sed_i() {
+    local expr="$1"
+    shift
+    for target in "$@"; do
+        if [ -f "$target" ]; then
+            sed -i.bak "$expr" "$target" 2>/dev/null && rm -f "$target.bak" || true
+        fi
+    done
+}
+
 if [ "$IS_TERMUX" -eq 1 ]; then
     if command -v termux-fix-shebang >/dev/null 2>&1; then
         termux-fix-shebang "$BIN_SRC" "$RAW_SRC" 2>/dev/null || true
     else
-        sed -i -E "1 s@^#\!(/usr)?/bin/(env\s+)?(.*)@#\!$PREFIX/bin/\3@" "$BIN_SRC" "$RAW_SRC" 2>/dev/null || true
+        run_sed_i "1 s@^#\!(/usr)?/bin/(env\s+)?(.*)@#\!$PREFIX/bin/\3@" "$BIN_SRC" "$RAW_SRC"
     fi
 else
-    # Standard POSIX: ensure standard shebang
-    sed -i "1s|^#!.*python.*|#!/usr/bin/env python3|" "$BIN_SRC" 2>/dev/null || true
-    sed -i "1s|^#!.*bash.*|#!/usr/bin/env bash|" "$RAW_SRC" 2>/dev/null || true
+    # Standard POSIX / macOS: ensure standard shebang
+    run_sed_i "1s|^#!.*python.*|#!/usr/bin/env python3|" "$BIN_SRC"
+    run_sed_i "1s|^#!.*bash.*|#!/usr/bin/env bash|" "$RAW_SRC"
 fi
 
 # 4. Create symlinks in bin directory
@@ -147,7 +158,7 @@ ln -sf "$RAW_SRC" "$TARGET_DIR/agy-raw"
 ln -sf "$RAW_SRC" "$TARGET_DIR/agy-orig"
 echo -e "\033[32m[✓] Installed executables: agy-pool, agy-raw, agy-orig in $TARGET_DIR\033[0m"
 
-# 5. Configure Shell Aliases (~/.bashrc and ~/.zshrc)
+# 5. Configure Shell Aliases (~/.bashrc, ~/.zshrc, ~/.zprofile, ~/.bash_profile)
 MARKER="# >>> agy-pool integration >>>"
 ALIAS_BLOCK="
 # >>> agy-pool integration >>>
@@ -156,8 +167,8 @@ alias agy-raw='agy-raw'
 alias agy-orig='agy-raw'
 # <<< agy-pool integration <<<"
 
-for rc in "$HOME/.bashrc" "$HOME/.zshrc"; do
-    if [ -f "$rc" ] || [ "$(basename "$rc")" = ".bashrc" ]; then
+for rc in "$HOME/.bashrc" "$HOME/.zshrc" "$HOME/.zprofile" "$HOME/.bash_profile"; do
+    if [ -f "$rc" ] || [ "$(basename "$rc")" = ".bashrc" ] || [ "$(basename "$rc")" = ".zshrc" ]; then
         touch "$rc" 2>/dev/null || true
         if ! grep -Fq "$MARKER" "$rc" 2>/dev/null; then
             echo "$ALIAS_BLOCK" >> "$rc" 2>/dev/null || true

@@ -1,4 +1,4 @@
-#!/data/data/com.termux/files/usr/bin/env bash
+#!/usr/bin/env bash
 # agy-raw: Directly execute original native Antigravity CLI without proxy gateway
 unset CLOUD_CODE_URL
 
