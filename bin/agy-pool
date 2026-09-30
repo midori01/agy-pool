@@ -65,7 +65,7 @@ except ImportError:
     HAS_TERMIOS = False
 
 # ----------------- Constants & Configuration -----------------
-VERSION = "0.1.0-beta.7"
+VERSION = "0.1.0-beta.8"
 QUOTA_FRESH_MAX_AGE = 60
 QUOTA_AGING_MAX_AGE = 300
 _QUOTA_REFRESH_LOCK = threading.Lock()
@@ -720,6 +720,22 @@ def _is_auth_error(status, body):
             "account is disabled", "user disabled"
         ))
     return False
+
+
+def _is_location_error(status, body):
+    if status not in (400, 403):
+        return False
+    text = body.decode("utf-8", errors="ignore").lower() if isinstance(body, (bytes, bytearray)) else str(body).lower()
+    return any(marker in text for marker in (
+        "user location is not supported",
+        "location is not supported",
+        "location_not_supported",
+        "user_location_not_supported",
+        "not supported in your country",
+        "not supported in your region",
+        "country not supported",
+        "region not supported"
+    )) or ("failed_precondition" in text and "location" in text)
 
 
 def _is_token_auth_error(error):
@@ -4328,7 +4344,7 @@ class SmartProxyHandler(http.server.BaseHTTPRequestHandler):
                 stored["gen_count"] = stored.get("gen_count", 0) + 1
                 stored["last_used_at"] = now_ts
                 record_generation_telemetry(pool, stored.get("id"), now=now_ts)
-            if stored.get("status") in ("validation_required", "auth_error"):
+            if stored.get("status") in ("validation_required", "auth_error") or stored.get("rate_limited_until", 0) > 0:
                 stored.pop("status", None)
                 stored.pop("validation_url", None)
                 stored.pop("rate_limited_until", None)
@@ -4347,6 +4363,14 @@ class SmartProxyHandler(http.server.BaseHTTPRequestHandler):
                 quota = stored.get("last_quota")
                 if isinstance(quota, dict):
                     quota["updated_at"] = 0
+                stored["error_count"] = stored.get("error_count", 0) + 1
+        pool_transaction(update)
+
+    def _record_location_error(self, account):
+        def update(pool):
+            stored = _find_account(pool, account)
+            if stored:
+                stored["rate_limited_until"] = time.time() + 30
                 stored["error_count"] = stored.get("error_count", 0) + 1
         pool_transaction(update)
 
@@ -4531,6 +4555,13 @@ class SmartProxyHandler(http.server.BaseHTTPRequestHandler):
                     sys.stderr.flush()
                     continue
 
+                # Failover on Location / GeoIP Not Supported (temporary datacenter IP / Anycast routing glitch)
+                elif _is_location_error(e.code, err_body):
+                    self._record_location_error(acc)
+                    sys.stderr.write(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [FAILOVER] Account {display_account_name(acc)} hit temporary location restriction (HTTP {e.code})! Auto-switching to next account (soft cooldown 30s)...\n")
+                    sys.stderr.flush()
+                    continue
+
                 # Failover on 429 (ResourceExhausted / Quota Exceeded) or 403 quota exhaustion
                 elif _is_quota_error(e.code, err_body):
                     self._record_quota_error(acc)
@@ -4609,7 +4640,7 @@ def start_proxy_daemon(foreground=False):
         os.fchmod(log_fd, 0o600)
         with os.fdopen(log_fd, "a") as logf:
             p = subprocess.Popen(cmd, stdout=logf, stderr=logf, start_new_session=True)
-        for _ in range(20):
+        for _ in range(50):
             if is_daemon_running() or p.poll() is not None:
                 break
             time.sleep(0.1)

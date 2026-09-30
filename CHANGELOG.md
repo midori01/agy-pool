@@ -5,6 +5,16 @@ All notable changes to the `agy-pool` project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.0-beta.8] - 2026-09-30
+
+### Added
+- **Automatic Failover & Self-Healing for HTTP 400 Location Restrictions**:
+  - Implemented `_is_location_error(status, body)` predicate recognizing Google Cloud Code / Gemini API temporary location restrictions (`User location is not supported for the API use`, `FAILED_PRECONDITION`, `location_not_supported`, etc.).
+  - Added in-flight request failover: when a Datacenter / Cloud VPS IP (e.g. Oracle Cloud AS31898) encounters intermittent Google Anycast backend cluster geo-fencing, the gateway proxy automatically failovers to the next eligible account in candidate list within milliseconds instead of terminating the user conversation.
+  - Implemented soft 30-second self-healing cooldown (`_record_location_error`): avoided immediate repeat hits on the same flapping edge node while preventing accounts from being falsely marked as permanently disabled or requiring manual verification.
+  - Enhanced `_record_success` to clear any residual `rate_limited_until` soft cooldowns upon successful generation, restoring accounts to active status instantly.
+  - Added 3 comprehensive automated unit tests (`test_location_error_predicates`, `test_location_400_fails_over_and_auto_recovers`, `test_generic_400_does_not_failover`) bringing total test coverage to 122/122 (100% pass rate).
+
 ## [0.1.0-beta.7] - 2026-09-26
 
 ### Added

@@ -519,6 +519,62 @@ class AgyPoolTest(unittest.TestCase):
         self.assertEqual(acc_a.get("validation_url"), "https://accounts.google.com/signin/continue?foo=bar")
         self.assertEqual(acc_a.get("last_quota", {}).get("remaining_fraction"), 0.0)
 
+    def test_location_error_predicates(self):
+        self.assertTrue(agy_pool._is_location_error(400, b'{"error":{"message":"User location is not supported for the API use."}}'))
+        self.assertTrue(agy_pool._is_location_error(400, b'{"error":{"status":"FAILED_PRECONDITION","message":"location is not supported"}}'))
+        self.assertTrue(agy_pool._is_location_error(403, b'{"error":{"message":"User location is not supported."}}'))
+        self.assertTrue(agy_pool._is_location_error(400, "User location is not supported"))
+        self.assertFalse(agy_pool._is_location_error(400, b'{"error":{"message":"Invalid JSON argument"}}'))
+        self.assertFalse(agy_pool._is_location_error(500, b'{"error":{"message":"User location is not supported"}}'))
+        self.assertFalse(agy_pool._is_location_error(200, b'ok'))
+
+    def test_location_400_fails_over_and_auto_recovers(self):
+        self.save_accounts([account("a"), account("b")])
+        loc_error = json.dumps({
+            "error": {
+                "code": 400,
+                "message": "User location is not supported for the API use.",
+                "status": "FAILED_PRECONDITION"
+            }
+        }).encode()
+        scenario = Scenario({
+            "token-a": [(400, loc_error, {})],
+            "token-b": [(200, b"success-from-b", {})],
+        })
+        proxy = self.start_proxy(scenario)
+        status, body, _ = self.request(proxy, "/v1internal:streamGenerateContent")
+        self.assertEqual((status, body), (200, b"success-from-b"))
+        self.assertEqual([call[0] for call in scenario.calls], ["token-a", "token-b"])
+
+        pool = agy_pool.load_pool()
+        acc_a = next(a for a in pool["accounts"] if a["id"] == "a")
+        # Soft cooldown must be set (30s) but NOT marked as permanent validation_required or auth_error
+        self.assertIsNone(acc_a.get("status"))
+        now = time.time()
+        self.assertGreater(acc_a.get("rate_limited_until", 0), now)
+        self.assertLessEqual(acc_a.get("rate_limited_until", 0), now + 35)
+        # Quota remains intact, not depleted
+        self.assertEqual(acc_a.get("last_quota", {}).get("remaining_fraction"), 1.0)
+
+    def test_generic_400_does_not_failover(self):
+        self.save_accounts([account("a"), account("b")])
+        bad_req = json.dumps({
+            "error": {
+                "code": 400,
+                "message": "Invalid argument: contents is required",
+                "status": "INVALID_ARGUMENT"
+            }
+        }).encode()
+        scenario = Scenario({
+            "token-a": [(400, bad_req, {})],
+            "token-b": [(200, b"wrong-retry", {})],
+        })
+        proxy = self.start_proxy(scenario)
+        status, body, _ = self.request(proxy, "/v1internal:streamGenerateContent")
+        self.assertEqual(status, 400)
+        self.assertEqual(body, bad_req)
+        self.assertEqual([call[0] for call in scenario.calls], ["token-a"])
+
     def test_started_sse_failure_is_not_replayed(self):
         self.save_accounts([account("a"), account("b")])
 
