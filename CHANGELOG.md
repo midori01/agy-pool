@@ -5,6 +5,17 @@ All notable changes to the `agy-pool` project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.0-beta.9] - 2026-10-01
+
+### Fixed
+- **Account Security Restriction Self-Healing & Quota Recovery Pipeline**:
+  - Fixed an issue where accounts unlocked from Google security verification (`validation_required`) remained stuck in restricted status because the status-clearing logic was previously limited to `retrieveUserQuotaSummary` and bypassed when falling back to `fetchAvailableModels` on consumer accounts.
+  - Implemented automatic clearing and atomic persistence of `status`, `validation_url`, and penalty `rate_limited_until` upon successful quota retrieval across both primary and fallback endpoints.
+  - Added detection and sanitization of fabricated `gemini_weekly` restriction markers (`0.0%` with null `resetTime`) upon account recovery, restoring true capacity state and preventing accounts from becoming falsely marked as `[Exhausted]`.
+  - Added support for `force=True` in `refresh_token` to bypass local token expiration caches when probing restricted accounts or executing `do_verify`.
+  - Added HTTP error classification for the fallback `fetchAvailableModels` endpoint, correctly recording `validation_url` and `validation_required` if verification is still required.
+  - Added 2 automated regression unit tests (`test_query_quota_fallback_clears_validation_and_auth_restrictions` and `test_query_quota_fallback_validation_error_classified`), bringing total test suite coverage to 124/124 (100% pass rate).
+
 ## [0.1.0-beta.8] - 2026-09-30
 
 ### Added

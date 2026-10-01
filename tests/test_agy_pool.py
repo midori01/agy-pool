@@ -3257,6 +3257,77 @@ class AgyPoolTest(unittest.TestCase):
         pool = agy_pool.load_pool()
         self.assertEqual([a["id"] for a in pool["accounts"]], ["acc_1", "acc_2"])
 
+    def test_query_quota_fallback_clears_validation_and_auth_restrictions(self):
+        acc = account("acc_restricted")
+        acc["status"] = "validation_required"
+        acc["validation_url"] = "https://accounts.google.com/signin/continue?test=1"
+        acc["rate_limited_until"] = time.time() + 86400
+        self.save_accounts([acc])
+
+        primary_err = urllib.error.HTTPError(
+            "https://cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary",
+            403, "Forbidden", {},
+            io.BytesIO(b'{"error": {"code": 403, "message": "SUBSCRIPTION_REQUIRED"}}')
+        )
+        fallback_resp = mock.MagicMock()
+        fallback_resp.__enter__.return_value = fallback_resp
+        fallback_resp.read.return_value = json.dumps({
+            "models": {
+                "gemini-3.8-flash-high": {
+                    "quotaInfo": {"remainingFraction": 0.95, "resetTime": "2026-10-08T10:00:00Z"}
+                }
+            }
+        }).encode()
+
+        with mock.patch.object(agy_pool, "refresh_token", return_value="test-token"), \
+             mock.patch.object(agy_pool.urllib.request, "urlopen", side_effect=[primary_err, fallback_resp]):
+            res = agy_pool.query_quota(acc)
+
+        self.assertEqual(res["gemini_5h"]["fraction"], 0.95)
+        self.assertNotIn("status", acc)
+        self.assertNotIn("validation_url", acc)
+        self.assertNotIn("rate_limited_until", acc)
+
+        stored = agy_pool.load_pool()["accounts"][0]
+        self.assertIsNone(stored.get("status"))
+        self.assertIsNone(stored.get("validation_url"))
+        self.assertIsNone(stored.get("rate_limited_until"))
+
+    def test_query_quota_fallback_validation_error_classified(self):
+        acc = account("acc_unrestricted")
+        self.save_accounts([acc])
+
+        primary_err = urllib.error.HTTPError(
+            "https://cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary",
+            403, "Forbidden", {},
+            io.BytesIO(b'{"error": {"code": 403, "message": "SUBSCRIPTION_REQUIRED"}}')
+        )
+        fallback_err = urllib.error.HTTPError(
+            "https://cloudcode-pa.googleapis.com/v1internal:fetchAvailableModels",
+            403, "Forbidden", {},
+            io.BytesIO(json.dumps({
+                "error": {
+                    "code": 403,
+                    "message": "validation_required: verify your account",
+                    "details": [{
+                        "metadata": {"validation_url": "https://accounts.google.com/test-verify"}
+                    }]
+                }
+            }).encode())
+        )
+
+        with mock.patch.object(agy_pool, "refresh_token", return_value="test-token"), \
+             mock.patch.object(agy_pool.urllib.request, "urlopen", side_effect=[primary_err, fallback_err]):
+            res = agy_pool.query_quota(acc)
+
+        self.assertEqual(res["gemini_5h"]["fraction"], 0.0)
+        self.assertEqual(acc.get("status"), "validation_required")
+        self.assertEqual(acc.get("validation_url"), "https://accounts.google.com/test-verify")
+
+        stored = agy_pool.load_pool()["accounts"][0]
+        self.assertEqual(stored.get("status"), "validation_required")
+        self.assertEqual(stored.get("validation_url"), "https://accounts.google.com/test-verify")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -65,7 +65,7 @@ except ImportError:
     HAS_TERMIOS = False
 
 # ----------------- Constants & Configuration -----------------
-VERSION = "0.1.0-beta.8"
+VERSION = "0.1.0-beta.9"
 QUOTA_FRESH_MAX_AGE = 60
 QUOTA_AGING_MAX_AGE = 300
 _QUOTA_REFRESH_LOCK = threading.Lock()
@@ -619,12 +619,12 @@ def backfill_account_names(pool):
     return changed
 
 
-def refresh_token(account):
-    """Refreshes the access token using refresh_token if close to expiry."""
+def refresh_token(account, force=False):
+    """Refreshes the access token using refresh_token if close to expiry or forced."""
     now = time.time()
     exp = account.get("token_expiry", 0)
-    # If valid for at least another 2 minutes, return existing access_token
-    if account.get("access_token") and (exp - now > 120):
+    # If valid for at least another 2 minutes and not forced, return existing access_token
+    if not force and account.get("access_token") and (exp - now > 120):
         return account["access_token"]
 
     lock_key = account.get("id") or account.get("email") or account.get("refresh_token", "")
@@ -637,7 +637,7 @@ def refresh_token(account):
                 if key in stored:
                     account[key] = stored[key]
         now = time.time()
-        if account.get("access_token") and account.get("token_expiry", 0) - now > 120:
+        if not force and account.get("access_token") and account.get("token_expiry", 0) - now > 120:
             return account["access_token"]
 
         rf = account.get("refresh_token")
@@ -844,9 +844,16 @@ def _fetch_available_models_quota(headers, quota_data):
     raise ValueError("model response contained no quota information")
 
 
-def query_quota(account):
+def query_quota(account, force_refresh_token=False):
     """Refresh cached quota, preserving known windows absent from a partial response."""
-    at = refresh_token(account)
+    force_refresh = force_refresh_token or (account.get("status") in ("validation_required", "auth_error"))
+    try:
+        at = refresh_token(account, force=force_refresh)
+    except Exception:
+        if force_refresh and account.get("access_token"):
+            at = account["access_token"]
+        else:
+            raise
     headers = {
         "Authorization": f"Bearer {at}",
         "Content-Type": "application/json",
@@ -864,12 +871,6 @@ def query_quota(account):
         )
         with urllib.request.urlopen(req, timeout=10) as resp:
             res = json.loads(resp.read().decode())
-
-        if account.get("status") in ("validation_required", "auth_error"):
-            account.pop("status", None)
-            account.pop("validation_url", None)
-            account.pop("rate_limited_until", None)
-            _persist_account_fields(account, ("status", "validation_url", "rate_limited_until"))
 
         found_quota = False
         for group in res.get("groups", []):
@@ -936,6 +937,44 @@ def query_quota(account):
         try:
             _fetch_available_models_quota(headers, quota_data)
         except Exception as fallback_error:
+            if isinstance(fallback_error, urllib.error.HTTPError):
+                fb_body = b""
+                try:
+                    try:
+                        fb_body = fallback_error.read()
+                    except Exception:
+                        fb_body = b""
+                finally:
+                    try:
+                        fallback_error.close()
+                    except Exception:
+                        pass
+                if _is_validation_error(fallback_error.code, fb_body) or _is_auth_error(fallback_error.code, fb_body):
+                    validation = _is_validation_error(fallback_error.code, fb_body)
+                    status = "validation_required" if validation else "auth_error"
+                    delay = 86400 if validation else 3600
+                    v_url = _extract_validation_url(fb_body) if validation else None
+                    account["status"] = status
+                    if v_url:
+                        account["validation_url"] = v_url
+                    account["rate_limited_until"] = time.time() + delay
+                    quota_data["gemini_5h"] = {"fraction": 0.0, "reset_time": None}
+                    quota_data["gemini_weekly"] = {"fraction": 0.0, "reset_time": None}
+                    _recompute_compat_quota(quota_data)
+                    quota_data["updated_at"] = int(time.time())
+                    account["last_quota"] = quota_data
+
+                    def update(pool):
+                        stored = _find_account(pool, account)
+                        if stored:
+                            stored["status"] = status
+                            if v_url:
+                                stored["validation_url"] = v_url
+                            stored["rate_limited_until"] = account["rate_limited_until"]
+                            stored["error_count"] = stored.get("error_count", 0) + 1
+                            stored["last_quota"] = quota_data
+                    pool_transaction(update)
+                    return quota_data
             raise fallback_error from quota_error
 
     except Exception as e:
@@ -948,6 +987,25 @@ def query_quota(account):
     _recompute_compat_quota(quota_data)
     quota_data["updated_at"] = int(time.time())
     account["last_quota"] = quota_data
+
+    had_restriction = account.get("status") in ("validation_required", "auth_error")
+    # Quota successfully retrieved! Clear any lingering validation/auth restriction
+    if had_restriction or account.get("status") in ("validation_required", "auth_error"):
+        account.pop("status", None)
+        account.pop("validation_url", None)
+        account.pop("rate_limited_until", None)
+        gw = quota_data.get("gemini_weekly")
+        if isinstance(gw, dict) and gw.get("reset_time") is None and gw.get("fraction") == 0.0:
+            quota_data.pop("gemini_weekly", None)
+            _recompute_compat_quota(quota_data)
+        _persist_account_fields(account, ("status", "validation_url", "rate_limited_until", "last_quota"))
+    else:
+        gw = quota_data.get("gemini_weekly")
+        if isinstance(gw, dict) and gw.get("reset_time") is None and gw.get("fraction") == 0.0:
+            quota_data.pop("gemini_weekly", None)
+            _recompute_compat_quota(quota_data)
+        _persist_account_fields(account, ("last_quota",))
+
     return quota_data
 
 
