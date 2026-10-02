@@ -5,6 +5,16 @@ All notable changes to the `agy-pool` project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.0-beta.10] - 2026-10-02
+
+### Changed
+- **Relocate Quota Freshness Badge to Account Header (`Hits: <N>  •  Age: <age>`)**:
+  - Relocated the quota age metadata from an isolated sub-item bullet to an inline badge directly following `Hits: <N>` in the account header row (`•  Age: <age>`).
+  - Completely restored visual consistency across account quota cards: sub-bullets now exclusively render pure quota capacity progress bars with reset countdowns without being broken up by non-progress metadata.
+  - Substantially improved vertical terminal density (saving 1 vertical line per account, reclaiming 14 screen lines on standard pools), noticeably reducing scroll fatigue in mobile Termux sessions.
+  - Implemented dynamic ANSI color hierarchy for freshness metadata: dim muted gray (`CLR_DIM`) for fresh and normal intervals to keep emphasis on account status, and warning amber (`CLR_YELLOW`) for stale data snapshots.
+  - Added unit test coverage (`test_format_quota_age_and_badge` and header assertions in `test_list_accounts_exhausted_and_hits`), bringing test suite coverage to 125/125 (100% pass rate).
+
 ## [0.1.0-beta.9] - 2026-10-01
 
 ### Fixed

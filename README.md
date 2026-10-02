@@ -1,6 +1,6 @@
 # agy-pool: Antigravity Multi-Account Quota Pool & Intelligent Load Balancer Suite
 
-[![Version](https://img.shields.io/badge/version-0.1.0--beta.9-blue.svg)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-0.1.0--beta.10-blue.svg)](CHANGELOG.md)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Platform](https://img.shields.io/badge/platform-Termux%20%7C%20Linux%20%7C%20macOS-green.svg)](#)
 [![Python: 3.8+](https://img.shields.io/badge/python-3.8+-blue.svg)](#)
@@ -83,15 +83,15 @@ The installer validates Python 3, sets up symlinks (`agy-pool`, `agy-raw`), conf
 ====================================================================
                  Antigravity Multi-Account Pool
 ====================================================================
-[1] Account 1 (Work)          [* Active]   Hits: 45
+[1] Account 1 (Work)          [* Active]   Hits: 45  •  Age: 12s
     • Gemini 5-Hour: [███████░░░]  67.3%  (Resets in 3h 59m)
     • Gemini Weekly: [█████████░]  94.6%  (Resets in 6d 9h)
 
-[2] Account 2                 [Ready]      Hits: 30
+[2] Account 2                 [Ready]      Hits: 30  •  Age: 15s
     • Gemini 5-Hour: [█████████░]  94.9%  (Resets in 3h 45m)
     • Gemini Weekly: [████████░░]  81.3%  (Resets in 3d 19h)
 
-[3] Account 3                 [Exhausted]  Hits: 12
+[3] Account 3                 [Exhausted]  Hits: 12  •  Age: 1m02s
     • Gemini 5-Hour: [██████████] 100.0%  (Resets in 5h 0m)
     • Gemini Weekly: [░░░░░░░░░░]   0.0%  (Resets in 2d 20h)
 --------------------------------------------------------------------

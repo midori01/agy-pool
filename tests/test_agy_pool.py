@@ -193,6 +193,23 @@ class AgyPoolTest(unittest.TestCase):
         self.assertEqual(agy_pool.quota_freshness({"last_quota": {}}, now)["class"], "unknown")
         self.assertEqual(agy_pool.quota_freshness(snapshot(now - 1, now - 1), now)["class"], "stale")
 
+    def test_format_quota_age_and_badge(self):
+        now = 1_000_000.0
+        acc_fresh = {"last_quota": {"updated_at": now - 25}}
+        acc_aging = {"last_quota": {"updated_at": now - 125}}
+        acc_stale = {"last_quota": {"updated_at": now - 600}}
+        acc_unknown = {"last_quota": {}}
+
+        self.assertEqual(agy_pool.format_quota_age(acc_fresh, now), "25s")
+        self.assertEqual(agy_pool.format_quota_age(acc_aging, now), "2m05s")
+        self.assertEqual(agy_pool.format_quota_age(acc_stale, now), "stale (10m)")
+        self.assertEqual(agy_pool.format_quota_age(acc_unknown, now), "unknown")
+
+        self.assertIn("•  Age: 25s", agy_pool.format_quota_age_badge(acc_fresh, now))
+        self.assertIn("•  Age: 2m05s", agy_pool.format_quota_age_badge(acc_aging, now))
+        self.assertIn("stale (10m)", agy_pool.format_quota_age_badge(acc_stale, now))
+        self.assertIn("•  Age: unknown", agy_pool.format_quota_age_badge(acc_unknown, now))
+
     def test_refresh_failure_uses_bounded_backoff_and_success_resets(self):
         self.refresh_patch.stop()
         acc = account("retry")
@@ -963,6 +980,8 @@ class AgyPoolTest(unittest.TestCase):
         self.assertIn("In Rotation Pool", output)
         self.assertNotIn("Total:", output)
         self.assertNotIn("AI Gen:", output)
+        self.assertIn("•  Age:", output)
+        self.assertNotIn("• Quota age:", output)
 
     def test_crypto_bundle_round_trip(self):
         msg = b"secret-oauth-data-12345"
