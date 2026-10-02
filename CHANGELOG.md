@@ -5,6 +5,17 @@ All notable changes to the `agy-pool` project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.0-beta.11] - 2026-10-02
+
+### Changed
+- **Unified Status Marker Architecture: In-Flight State Replaces Ready (`[⚡ Running (N)]` / `[* ⚡ Running (N)]`)**:
+  - Replaced the redundant dual-badge layout (`[Ready] [⚡ Running (N)]`) in `status` / `quota` / `list` with a unified, mutually exclusive state marker.
+  - Candidate rotation pool accounts processing active requests now cleanly transition from `[Ready]` to `[⚡ Running (N)]`.
+  - The active base account (CLI Base Token) executing requests now dynamically renders as `[* ⚡ Running (N)]` (preserving green asterisk identity with cyan running badge).
+  - Aligned interactive `top` dashboard (`render_top_frame`): active accounts running requests now display as `[* ⚡ Running]` without losing base token identity, keeping status badge styles 100% unified across static and live monitoring modes.
+  - Adjusted dynamic layout engine `status_w` to 14 columns across widths >= 60, ensuring zero column truncation or overflow across all supported terminal sizes.
+  - Added unit test `test_list_accounts_in_flight_replaces_ready_and_active`, bringing test suite coverage to 126/126 (100% pass rate).
+
 ## [0.1.0-beta.10] - 2026-10-02
 
 ### Changed

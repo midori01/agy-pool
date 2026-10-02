@@ -983,6 +983,37 @@ class AgyPoolTest(unittest.TestCase):
         self.assertIn("•  Age:", output)
         self.assertNotIn("• Quota age:", output)
 
+    def test_list_accounts_in_flight_replaces_ready_and_active(self):
+        acc1 = account("a")
+        acc2 = account("b")
+        acc3 = account("c")
+        self.save_accounts([acc1, acc2, acc3])
+
+        class MockResp:
+            def read(self):
+                return json.dumps({"in_flight": {acc1["id"]: 1, acc2["id"]: 3}}).encode()
+            def __enter__(self):
+                return self
+            def __exit__(self, *args):
+                pass
+
+        buf = io.StringIO()
+        with mock.patch("sys.stdout", buf), \
+             mock.patch.object(agy_pool, "get_daemon_info", return_value={"pid": 1234, "version": agy_pool.VERSION}), \
+             mock.patch.object(agy_pool, "is_port_listening", return_value=True), \
+             mock.patch("urllib.request.urlopen", return_value=MockResp()), \
+             mock.patch.object(agy_pool, "_safe_quota"):
+            agy_pool.list_accounts()
+
+        output = buf.getvalue()
+        clean = agy_pool._ANSI_ESCAPE_RE.sub("", output)
+        account_rows = [l for l in clean.split("\n") if l.startswith("[")]
+        self.assertIn("[1] Account  [* ⚡ Running (1)]", account_rows[0])
+        self.assertNotIn("[* Active]", account_rows[0])
+        self.assertIn("[2] Account  [⚡ Running (3)]", account_rows[1])
+        self.assertNotIn("[Ready]", account_rows[1])
+        self.assertIn("[3] Account  [Ready]", account_rows[2])
+
     def test_crypto_bundle_round_trip(self):
         msg = b"secret-oauth-data-12345"
         enc = agy_pool.encrypt_bundle(msg, "pass123")
