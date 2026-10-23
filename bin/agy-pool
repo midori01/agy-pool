@@ -65,7 +65,7 @@ except ImportError:
     HAS_TERMIOS = False
 
 # ----------------- Constants & Configuration -----------------
-VERSION = "0.1.0-beta.11"
+VERSION = "0.1.0-beta.12"
 QUOTA_FRESH_MAX_AGE = 60
 QUOTA_AGING_MAX_AGE = 300
 _QUOTA_REFRESH_LOCK = threading.Lock()
@@ -165,9 +165,27 @@ def get_installed_agy_version():
     return "1.2.2"
 
 INSTALLED_AGY_VER = get_installed_agy_version()
-ARCH = "arm64" if platform.machine() in ["aarch64", "arm64"] else platform.machine()
-OS_TYPE = "linux" if platform.system().lower() == "linux" else platform.system().lower()
-DEFAULT_UA = f"antigravity/cli/{INSTALLED_AGY_VER} (aidev_client; os_type={OS_TYPE}; arch={ARCH}; auth_method=consumer)"
+_machine = platform.machine()
+if _machine in ("aarch64", "arm64"):
+    ARCH = "arm64"
+elif _machine in ("x86_64", "amd64", "AMD64"):
+    ARCH = "amd64"
+else:
+    ARCH = _machine.lower()
+# Termux Python reports "Android", but native agy builds identify as linux.
+OS_TYPE = "linux" if platform.system().lower() in ("linux", "android") else platform.system().lower()
+
+# Build changelist reported by the native agy CLI 1.4.6 User-Agent, used only for the synthesized fallback UA.
+AGY_CLI_CL = "1005129088"
+DEFAULT_UA = f"antigravity/cli/{INSTALLED_AGY_VER} (aidev_client; os_type={OS_TYPE}; arch={ARCH}; cl={AGY_CLI_CL}; auth_method=consumer)"
+
+# Mirrors the Antigravity desktop app ("hub") User-Agent.
+DESKTOP_HUB_VERSION = "2.26.0"
+DESKTOP_HUB_CL = "1005016104"
+DESKTOP_UA = f"antigravity/hub/{DESKTOP_HUB_VERSION} (aidev_client; os_type={OS_TYPE}; arch={ARCH}; cl={DESKTOP_HUB_CL})"
+
+USER_AGENT_ENV = "AGY_USER_AGENT"
+USER_AGENT_MAX_LEN = 512
 POOL_LOCK = threading.RLock()
 FILE_LOCKS = {}
 FILE_LOCKS_LOCK = threading.Lock()
@@ -460,6 +478,88 @@ def save_pool(data):
         pool.clear()
         pool.update(data)
     pool_transaction(replace)
+
+
+def normalize_user_agent_setting(value):
+    """Return None (auto), "desktop", or a validated custom UA; raise ValueError if invalid."""
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        value = str(value)
+    val_str = value.strip()
+    val_lower = val_str.lower()
+    if val_lower in ("", "auto", "default", "reset", "none", "off", "clear"):
+        return None
+    if val_lower in ("desktop", "hub"):
+        return "desktop"
+    if len(val_str) > USER_AGENT_MAX_LEN:
+        raise ValueError(f"User-Agent exceeds maximum allowed length of {USER_AGENT_MAX_LEN} characters")
+    if any(ord(c) < 0x20 or ord(c) > 0x7E for c in val_str):
+        raise ValueError("User-Agent contains invalid characters (only printable ASCII 0x20-0x7E allowed)")
+    return val_str
+
+
+def configured_user_agent(pool=None):
+    """
+    Determine the configured User-Agent setting and its source.
+    Returns (setting, source) where setting is None, 'desktop', or a custom string,
+    and source is 'env', 'config', or 'default'.
+    """
+    env_ua = os.environ.get(USER_AGENT_ENV)
+    if env_ua is not None and env_ua.strip() != "":
+        try:
+            val = normalize_user_agent_setting(env_ua)
+            return (val, "env")
+        except ValueError:
+            pass
+
+    target_pool = pool
+    if target_pool is None:
+        try:
+            target_pool = _read_pool_unlocked()
+        except Exception:
+            target_pool = {}
+
+    val = None
+    if isinstance(target_pool, dict):
+        raw_val = target_pool.get("user_agent")
+        if raw_val is not None:
+            try:
+                val = normalize_user_agent_setting(raw_val)
+            except ValueError:
+                val = None
+
+    if val:
+        return (val, "config")
+    return (None, "default")
+
+
+def resolve_user_agent(client_ua=None, pool=None):
+    """
+    Resolve the effective User-Agent string to use when sending requests upstream.
+    """
+    setting = configured_user_agent(pool)[0]
+    if setting == "desktop":
+        return DESKTOP_UA
+    if setting is not None:
+        return setting
+    if client_ua and client_ua.startswith("antigravity/"):
+        return client_ua
+    return DEFAULT_UA
+
+
+def describe_user_agent(pool=None):
+    """Human-readable description of the effective User-Agent setting."""
+    setting, source = configured_user_agent(pool)
+    if setting is None:
+        text = f"auto (pass-through native client UA, fallback: {DEFAULT_UA})"
+    elif setting == "desktop":
+        text = f"desktop ({DESKTOP_UA})"
+    else:
+        text = setting
+    if source == "env":
+        text += f" [{USER_AGENT_ENV} env]"
+    return text
 
 
 def _find_account(pool, account):
@@ -857,7 +957,7 @@ def query_quota(account, force_refresh_token=False):
     headers = {
         "Authorization": f"Bearer {at}",
         "Content-Type": "application/json",
-        "User-Agent": DEFAULT_UA
+        "User-Agent": resolve_user_agent()
     }
     quota_data = _cached_quota_state(account.get("last_quota"))
 
@@ -2599,10 +2699,12 @@ def manage_config(key=None, value=None):
         print(f"  • {CLR_CYAN}show_email{CLR_RESET}:   {show_email_eff} [Config: {show_email_cfg if show_email_cfg is not None else '<default: False>'}{env_str}]")
         print(f"  • {CLR_CYAN}strategy{CLR_RESET}:     {strategy}")
         print(f"  • {CLR_CYAN}top_interval{CLR_RESET}: {pool.get('top_interval', 2.0):.1f}s")
+        print(f"  • {CLR_CYAN}user_agent{CLR_RESET}:   {describe_user_agent(pool)}")
         print(f"\nUsage:")
         print(f"  agy-pool config show_email <true|false|on|off>")
         print(f"  agy-pool config strategy <max_quota|round_robin|least_used>")
-        print(f"  agy-pool config top_interval <seconds (0.5 - 60.0)>\n")
+        print(f"  agy-pool config top_interval <seconds (0.5 - 60.0)>")
+        print(f"  agy-pool config user_agent <auto|desktop|\"custom UA string\">\n")
         return
 
     k = key.strip().lower().replace("-", "_")
@@ -2645,9 +2747,39 @@ def manage_config(key=None, value=None):
             p["top_interval"] = val
         pool_transaction(update)
         print(f"{CLR_GREEN}✓ Configuration updated: top_interval = {val:.1f}s{CLR_RESET}")
+    elif k in ("user_agent", "ua", "useragent"):
+        if value is None:
+            print(f"user_agent: {describe_user_agent(pool)}")
+            return
+
+        try:
+            val = normalize_user_agent_setting(value)
+        except ValueError as e:
+            print(f"{CLR_RED}[Error] Invalid User-Agent: {e}{CLR_RESET}")
+            sys.exit(1)
+
+        if val is None:
+            def update(p):
+                p.pop("user_agent", None)
+            pool_transaction(update)
+            print(f"{CLR_GREEN}✓ Configuration updated: user_agent = auto (pass-through native client UA){CLR_RESET}")
+        elif val == "desktop":
+            def update(p):
+                p["user_agent"] = "desktop"
+            pool_transaction(update)
+            print(f"{CLR_GREEN}✓ Configuration updated: user_agent = desktop ({DESKTOP_UA}){CLR_RESET}")
+        else:
+            def update(p):
+                p["user_agent"] = val
+            pool_transaction(update)
+            print(f"{CLR_GREEN}✓ Configuration updated: user_agent = {val}{CLR_RESET}")
+
+        env_val = os.environ.get(USER_AGENT_ENV)
+        if env_val and env_val.strip():
+            print(f"{CLR_YELLOW}Note: AGY_USER_AGENT environment variable is set and overrides pool configuration.{CLR_RESET}")
     else:
         print(f"{CLR_RED}[Error] Unknown configuration key: {key}{CLR_RESET}")
-        print("Supported keys: show_email, strategy, top_interval")
+        print("Supported keys: show_email, strategy, top_interval, user_agent")
         sys.exit(1)
 
 
@@ -4568,9 +4700,7 @@ class SmartProxyHandler(http.server.BaseHTTPRequestHandler):
 
         # Forward with failover retry loop
         last_error = None
-        client_ua = self.headers.get("User-Agent", "")
-        if not client_ua.startswith("antigravity/"):
-            client_ua = DEFAULT_UA
+        client_ua = resolve_user_agent(self.headers.get("User-Agent", ""), pool)
 
         for acc in candidates:
             try:
@@ -5092,6 +5222,7 @@ def main():
   agy-pool switch auto      Switch active account to the one with highest quota
   agy-pool export           Export accounts pool to a backup JSON file
   agy-pool import file.json Restore accounts pool from a backup file
+  agy-pool config ua desktop  Spoof the latest Antigravity desktop app User-Agent
   agy-pool start            Start the load balancing reverse proxy daemon
   agy-pool run              Launch agy with automated quota load balancing
 """
@@ -5186,9 +5317,9 @@ def main():
     top_p.add_argument("--show-email", dest="show_email", action="store_true", default=None, help="Display real email addresses")
     top_p.add_argument("--hide-email", dest="show_email", action="store_false", help="Hide real email addresses")
     # config
-    cfg_p = subparsers.add_parser("config", help="View or update pool configuration settings (e.g. show_email, strategy)")
-    cfg_p.add_argument("key", nargs="?", default=None, help="Configuration key (show_email, strategy)")
-    cfg_p.add_argument("value", nargs="?", default=None, help="Value to set (e.g. true/false)")
+    cfg_p = subparsers.add_parser("config", help="View or update pool configuration settings (e.g. show_email, strategy, user_agent)")
+    cfg_p.add_argument("key", nargs="?", default=None, help="Configuration key (show_email, strategy, user_agent)")
+    cfg_p.add_argument("value", nargs="*", default=None, help="Value to set (e.g. true/false, desktop)")
     subparsers.add_parser("version", help="Show version information")
     subparsers.add_parser("daemon-run", help=argparse.SUPPRESS)  # Internal daemon worker
     # run wrapper
@@ -5260,7 +5391,7 @@ def main():
                 print(f"{CLR_YELLOW}○ Gateway Proxy is STOPPED{CLR_RESET}")
             list_accounts(show_email=getattr(args, "show_email", None))
     elif cmd == "config":
-        manage_config(args.key, args.value)
+        manage_config(args.key, " ".join(args.value) if args.value else None)
     elif cmd == "version":
         print(f"agy-pool {VERSION}")
     elif cmd == "daemon-run":

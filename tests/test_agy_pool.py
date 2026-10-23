@@ -3378,6 +3378,219 @@ class AgyPoolTest(unittest.TestCase):
         self.assertEqual(stored.get("status"), "validation_required")
         self.assertEqual(stored.get("validation_url"), "https://accounts.google.com/test-verify")
 
+    def test_user_agent_constants_and_arch(self):
+        with mock.patch.dict(os.environ):
+            os.environ.pop("AGY_USER_AGENT", None)
+            self.assertEqual(agy_pool.AGY_CLI_CL, "1005129088")
+            self.assertEqual(agy_pool.DESKTOP_HUB_VERSION, "2.26.0")
+            self.assertEqual(agy_pool.DESKTOP_HUB_CL, "1005016104")
+            self.assertIn("cl=1005129088", agy_pool.DEFAULT_UA)
+            self.assertIn("cl=1005016104", agy_pool.DESKTOP_UA)
+            self.assertNotIn("os_type=android", agy_pool.DEFAULT_UA)
+            self.assertNotIn("os_type=android", agy_pool.DESKTOP_UA)
+            self.assertTrue(agy_pool.DEFAULT_UA.startswith("antigravity/cli/"))
+            self.assertTrue(agy_pool.DESKTOP_UA.startswith("antigravity/hub/2.26.0"))
+            self.assertEqual(agy_pool.USER_AGENT_ENV, "AGY_USER_AGENT")
+            self.assertEqual(agy_pool.USER_AGENT_MAX_LEN, 512)
+
+    def test_normalize_user_agent_setting(self):
+        with mock.patch.dict(os.environ):
+            os.environ.pop("AGY_USER_AGENT", None)
+            # auto aliases -> None
+            for alias in (None, "", "  ", "auto", "AUTO", "default", "DEFAULT", "reset", "none", "off", "clear"):
+                self.assertIsNone(agy_pool.normalize_user_agent_setting(alias))
+
+            # desktop / hub -> "desktop"
+            self.assertEqual(agy_pool.normalize_user_agent_setting("desktop"), "desktop")
+            self.assertEqual(agy_pool.normalize_user_agent_setting("Desktop"), "desktop")
+            self.assertEqual(agy_pool.normalize_user_agent_setting("hub"), "desktop")
+            self.assertEqual(agy_pool.normalize_user_agent_setting("HUB"), "desktop")
+
+            # custom passes stripped
+            self.assertEqual(agy_pool.normalize_user_agent_setting("  MyAgent/1.0  "), "MyAgent/1.0")
+
+            # invalid strings raise ValueError
+            with self.assertRaises(ValueError):
+                agy_pool.normalize_user_agent_setting("a\r\nX: y")
+            with self.assertRaises(ValueError):
+                agy_pool.normalize_user_agent_setting("uaé")
+            with self.assertRaises(ValueError):
+                agy_pool.normalize_user_agent_setting("a" * 513)
+
+            # valid max length string (512 chars) does not raise
+            self.assertEqual(len(agy_pool.normalize_user_agent_setting("a" * 512)), 512)
+
+    def test_resolve_user_agent(self):
+        with mock.patch.dict(os.environ):
+            os.environ.pop("AGY_USER_AGENT", None)
+            # auto passes through "antigravity/cli/9.9.9 (x)"
+            self.assertEqual(
+                agy_pool.resolve_user_agent("antigravity/cli/9.9.9 (x)", pool={}),
+                "antigravity/cli/9.9.9 (x)"
+            )
+            # auto with "python-requests/2" or "" or None -> DEFAULT_UA
+            self.assertEqual(
+                agy_pool.resolve_user_agent("python-requests/2", pool={}),
+                agy_pool.DEFAULT_UA
+            )
+            self.assertEqual(
+                agy_pool.resolve_user_agent("", pool={}),
+                agy_pool.DEFAULT_UA
+            )
+            self.assertEqual(
+                agy_pool.resolve_user_agent(None, pool={}),
+                agy_pool.DEFAULT_UA
+            )
+
+            # desktop -> DESKTOP_UA even if client sent an antigravity UA
+            desktop_pool = {"user_agent": "desktop"}
+            self.assertEqual(
+                agy_pool.resolve_user_agent("antigravity/cli/1.4.6", pool=desktop_pool),
+                agy_pool.DESKTOP_UA
+            )
+
+            # custom -> custom even if client sent an antigravity UA
+            custom_pool = {"user_agent": "CustomAgent/2.0"}
+            self.assertEqual(
+                agy_pool.resolve_user_agent("antigravity/cli/1.4.6", pool=custom_pool),
+                "CustomAgent/2.0"
+            )
+
+            # env AGY_USER_AGENT="desktop" overrides pool custom
+            os.environ["AGY_USER_AGENT"] = "desktop"
+            self.assertEqual(
+                agy_pool.resolve_user_agent("antigravity/cli/1.4.6", pool=custom_pool),
+                agy_pool.DESKTOP_UA
+            )
+
+            # invalid env value falls back to pool value
+            os.environ["AGY_USER_AGENT"] = "bad\r\ninjection"
+            self.assertEqual(
+                agy_pool.resolve_user_agent("antigravity/cli/1.4.6", pool=custom_pool),
+                "CustomAgent/2.0"
+            )
+
+    def test_manage_config_user_agent(self):
+        with mock.patch.dict(os.environ):
+            os.environ.pop("AGY_USER_AGENT", None)
+            self.save_accounts([account("a")])
+
+            # manage_config("user_agent", "desktop") persists "desktop"
+            buf = io.StringIO()
+            with mock.patch("sys.stdout", buf):
+                agy_pool.manage_config("user_agent", "desktop")
+            self.assertIn("user_agent = desktop", buf.getvalue())
+            pool = agy_pool.load_pool()
+            self.assertEqual(pool.get("user_agent"), "desktop")
+
+            # manage_config("ua", "auto") removes the key
+            buf = io.StringIO()
+            with mock.patch("sys.stdout", buf):
+                agy_pool.manage_config("ua", "auto")
+            self.assertIn("user_agent = auto", buf.getvalue())
+            pool = agy_pool.load_pool()
+            self.assertNotIn("user_agent", pool)
+
+            # manage_config("ua", "bad\r\nvalue") raises SystemExit and leaves pool unchanged
+            pool_before = agy_pool.load_pool()
+            buf = io.StringIO()
+            err_buf = io.StringIO()
+            with mock.patch("sys.stdout", buf), mock.patch("sys.stderr", err_buf):
+                with self.assertRaises(SystemExit) as cm:
+                    agy_pool.manage_config("ua", "bad\r\nvalue")
+                self.assertEqual(cm.exception.code, 1)
+            self.assertIn("[Error] Invalid User-Agent:", buf.getvalue())
+            pool_after = agy_pool.load_pool()
+            self.assertEqual(pool_before, pool_after)
+
+            # query user_agent setting without value
+            buf = io.StringIO()
+            with mock.patch("sys.stdout", buf):
+                agy_pool.manage_config("user_agent", None)
+            self.assertIn("user_agent: auto", buf.getvalue())
+
+    def test_proxy_user_agent_end_to_end(self):
+        with mock.patch.dict(os.environ):
+            os.environ.pop("AGY_USER_AGENT", None)
+            self.save_accounts([account("a")])
+
+            # 1. Pool with user_agent="MyAgent/1.0"
+            agy_pool.pool_transaction(lambda p: p.update(user_agent="MyAgent/1.0"))
+            scenario = Scenario({"token-a": [(200, b"ok-a", {})]})
+            proxy = self.start_proxy(scenario)
+            status, _, _ = self.request(
+                proxy,
+                path="/v1internal:streamGenerateContent",
+                headers={"User-Agent": "antigravity/cli/1.4.6 (aidev_client)"}
+            )
+            self.assertEqual(status, 200)
+            self.assertEqual(len(scenario.calls), 1)
+            upstream_headers = scenario.calls[0][2]
+            self.assertEqual(upstream_headers.get("User-Agent"), "MyAgent/1.0")
+
+            # 2. Without setting (auto mode): upstream receives client antigravity UA unchanged
+            agy_pool.pool_transaction(lambda p: p.pop("user_agent", None))
+            scenario2 = Scenario({"token-a": [(200, b"ok-a", {})]})
+            proxy2 = self.start_proxy(scenario2)
+            status, _, _ = self.request(
+                proxy2,
+                path="/v1internal:streamGenerateContent",
+                headers={"User-Agent": "antigravity/cli/1.4.6 (aidev_client)"}
+            )
+            self.assertEqual(status, 200)
+            self.assertEqual(len(scenario2.calls), 1)
+            upstream_headers2 = scenario2.calls[0][2]
+            self.assertEqual(upstream_headers2.get("User-Agent"), "antigravity/cli/1.4.6 (aidev_client)")
+
+    def test_query_quota_sends_configured_user_agent(self):
+        with mock.patch.dict(os.environ):
+            os.environ.pop("AGY_USER_AGENT", None)
+            acc = account("q_acc")
+            self.save_accounts([acc])
+
+            captured_requests = []
+            def fake_urlopen(req, timeout=10):
+                captured_requests.append(req)
+                resp_data = json.dumps({
+                    "groups": [{
+                        "buckets": [
+                            {"bucketId": "gemini_5h", "remainingFraction": 0.85, "resetTime": "2026-10-23T20:00:00Z"},
+                            {"bucketId": "gemini_weekly", "remainingFraction": 0.90, "resetTime": "2026-10-30T00:00:00Z"}
+                        ]
+                    }]
+                }).encode()
+                return io.BytesIO(resp_data)
+
+            # 1. With desktop config in pool
+            agy_pool.pool_transaction(lambda p: p.update(user_agent="desktop"))
+            with mock.patch.object(agy_pool, "refresh_token", return_value="test-token"), \
+                 mock.patch.object(agy_pool.urllib.request, "urlopen", side_effect=fake_urlopen):
+                agy_pool.query_quota(acc)
+
+            self.assertEqual(len(captured_requests), 1)
+            self.assertEqual(captured_requests[0].get_header("User-agent"), agy_pool.DESKTOP_UA)
+
+            # 2. With env AGY_USER_AGENT override
+            captured_requests.clear()
+            os.environ["AGY_USER_AGENT"] = "EnvOverrideAgent/3.0"
+            with mock.patch.object(agy_pool, "refresh_token", return_value="test-token"), \
+                 mock.patch.object(agy_pool.urllib.request, "urlopen", side_effect=fake_urlopen):
+                agy_pool.query_quota(acc)
+
+            self.assertEqual(len(captured_requests), 1)
+            self.assertEqual(captured_requests[0].get_header("User-agent"), "EnvOverrideAgent/3.0")
+
+            # 3. Default / auto fallback
+            captured_requests.clear()
+            os.environ.pop("AGY_USER_AGENT", None)
+            agy_pool.pool_transaction(lambda p: p.pop("user_agent", None))
+            with mock.patch.object(agy_pool, "refresh_token", return_value="test-token"), \
+                 mock.patch.object(agy_pool.urllib.request, "urlopen", side_effect=fake_urlopen):
+                agy_pool.query_quota(acc)
+
+            self.assertEqual(len(captured_requests), 1)
+            self.assertEqual(captured_requests[0].get_header("User-agent"), agy_pool.DEFAULT_UA)
+
 
 if __name__ == "__main__":
     unittest.main()

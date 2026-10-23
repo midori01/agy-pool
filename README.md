@@ -1,6 +1,6 @@
 # agy-pool: Antigravity Multi-Account Quota Pool & Intelligent Load Balancer Suite
 
-[![Version](https://img.shields.io/badge/version-0.1.0--beta.11-blue.svg)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-0.1.0--beta.12-blue.svg)](CHANGELOG.md)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Platform](https://img.shields.io/badge/platform-Termux%20%7C%20Linux%20%7C%20macOS-green.svg)](#)
 [![Python: 3.8+](https://img.shields.io/badge/python-3.8+-blue.svg)](#)
@@ -78,6 +78,27 @@ The installer validates Python 3, sets up symlinks (`agy-pool`, `agy-raw`), conf
 | `agy-pool forecast` | Predict quota runway, burn rates, and staggered replenishment (`--pace`, `--json`) |
 | `agy-pool export [-e]` | Export accounts (plain or encrypted with `-e` / `--password`) |
 | `agy-pool import <file>`| Restore/merge accounts from backup (supports `-` for stdin) |
+
+### Custom User-Agent
+
+`agy-pool` supports configurable User-Agent spoofing for both proxy traffic and quota probes:
+- **`auto`** (default): Passes through the client's native `antigravity/...` User-Agent, falling back to a synthesized native CLI UA.
+- **`desktop`**: Emulates the official Antigravity desktop app (`antigravity/hub/2.26.0 ...`).
+- **Custom string**: Any literal custom User-Agent string (printable ASCII, max 512 characters).
+
+```bash
+# Spoof Antigravity desktop app
+agy-pool config ua desktop
+
+# Set custom User-Agent string
+agy-pool config ua "MyCustomClient/1.0 (aidev_client)"
+
+# Reset to automatic pass-through
+agy-pool config ua auto
+
+# Environment variable override (applies immediately without daemon restart)
+export AGY_USER_AGENT="desktop"
+```
 
 ```text
 ====================================================================

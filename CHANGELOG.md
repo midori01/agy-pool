@@ -5,6 +5,22 @@ All notable changes to the `agy-pool` project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.0-beta.12] - 2026-10-23
+
+### Added
+- **Configurable Custom User-Agent Feature (`auto` / `desktop` / custom)**:
+  - Added support for configuring a custom User-Agent via `agy-pool config user_agent <auto|desktop|"custom UA string">` (aliases `ua`, `useragent`).
+  - Added `desktop` spoofing mode mirroring the official Antigravity desktop app (`antigravity/hub/2.26.0 (aidev_client; os_type=...; arch=...; cl=1005016104)`, with the build changelist taken from the 2.26.0 `language_server` binary).
+  - Added environment variable override `AGY_USER_AGENT` taking precedence over pool configuration without daemon restart.
+  - Applies to both proxy forwarding and background quota probes (`query_quota`) dynamically without requiring gateway restarts.
+  - Added comprehensive automated unit test coverage across normalization, resolution, persistence, proxy forwarding, and quota probes, bringing total test suite coverage to 132/132 (100% pass rate).
+
+### Fixed
+- **CLI Fallback User-Agent Compliance & Architecture Alignment**:
+  - Fallback CLI UA now includes the `cl=1005129088` build changelist, aligning synthesized fallback headers with native `antigravity/cli` 1.4.6.
+  - Standardized architecture mapping to Go-style names (`amd64` for x86_64/AMD64, `arm64` for aarch64/arm64).
+  - Synthesized UAs now report `os_type=linux` on Termux (newer Python returns `Android` from `platform.system()`), matching the native agy binary.
+
 ## [0.1.0-beta.11] - 2026-10-02
 
 ### Changed
