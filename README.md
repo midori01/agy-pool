@@ -1,6 +1,6 @@
 # agy-pool: Antigravity Multi-Account Quota Pool & Intelligent Load Balancer Suite
 
-[![Version](https://img.shields.io/badge/version-0.1.0--beta.12-blue.svg)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-0.1.0--beta.13-blue.svg)](CHANGELOG.md)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Platform](https://img.shields.io/badge/platform-Termux%20%7C%20Linux%20%7C%20macOS-green.svg)](#)
 [![Python: 3.8+](https://img.shields.io/badge/python-3.8+-blue.svg)](#)
@@ -98,6 +98,24 @@ agy-pool config ua auto
 
 # Environment variable override (applies immediately without daemon restart)
 export AGY_USER_AGENT="desktop"
+```
+
+### Per-Account Model Fallback
+
+Not every account in a pool can use every model. When a rotated account answers a generation request with HTTP 404 (`NOT_FOUND`, the requested model is not enabled for it), the gateway retries the same request on that account with a fallback model instead of failing the agy session:
+- **`auto`** (default): Falls back to `gemini-3.8-flash`, keeping the requested tier (`low` / `medium` / `high`; `XHIGH` maps to `high`). `thinkingLevel` is rewritten to match and `maxOutputTokens` is capped at 65536.
+- **Model id**: A family (`gemini-3.8-flash`) keeps tier matching; a full id (`gemini-3.8-flash-high`) pins the tier.
+- **`off`**: Passes model-unavailable errors through unchanged.
+
+Accounts that can use the requested model are never rewritten. A 404 is remembered per account and model for 60 minutes, so later requests on that account go straight to the fallback model.
+
+```bash
+agy-pool config fallback_model auto
+agy-pool config fallback_model gemini-3.8-flash-high
+agy-pool config fallback_model off
+
+# Environment variable override
+export AGY_FALLBACK_MODEL="off"
 ```
 
 ```text

@@ -65,7 +65,7 @@ except ImportError:
     HAS_TERMIOS = False
 
 # ----------------- Constants & Configuration -----------------
-VERSION = "0.1.0-beta.12"
+VERSION = "0.1.0-beta.13"
 QUOTA_FRESH_MAX_AGE = 60
 QUOTA_AGING_MAX_AGE = 300
 _QUOTA_REFRESH_LOCK = threading.Lock()
@@ -186,6 +186,17 @@ DESKTOP_UA = f"antigravity/hub/{DESKTOP_HUB_VERSION} (aidev_client; os_type={OS_
 
 USER_AGENT_ENV = "AGY_USER_AGENT"
 USER_AGENT_MAX_LEN = 512
+
+# Generation requests that hit HTTP 404 (model not enabled for the account) are retried
+# on the same account with this model family; the tier follows the requested thinking level.
+FALLBACK_MODEL_ENV = "AGY_FALLBACK_MODEL"
+DEFAULT_FALLBACK_MODEL = "gemini-3.8-flash"
+FALLBACK_MODEL_MAX_LEN = 128
+FALLBACK_MODEL_TIERS = ("low", "medium", "high")
+FALLBACK_MAX_OUTPUT_TOKENS = 65536
+MODEL_UNAVAILABLE_TTL = 3600
+_MODEL_UNAVAILABLE = {}
+_MODEL_UNAVAILABLE_LOCK = threading.Lock()
 POOL_LOCK = threading.RLock()
 FILE_LOCKS = {}
 FILE_LOCKS_LOCK = threading.Lock()
@@ -560,6 +571,143 @@ def describe_user_agent(pool=None):
     if source == "env":
         text += f" [{USER_AGENT_ENV} env]"
     return text
+
+
+def normalize_fallback_model_setting(value):
+    """Return None (default), "off", or a validated model id; raise ValueError if invalid."""
+    if value is None:
+        return None
+    val_str = str(value).strip()
+    val_lower = val_str.lower()
+    if val_lower in ("", "auto", "default", "reset", "clear"):
+        return None
+    if val_lower in ("off", "none", "disable", "disabled", "false", "0"):
+        return "off"
+    if len(val_str) > FALLBACK_MODEL_MAX_LEN or not re.fullmatch(r"[A-Za-z0-9._-]+", val_str):
+        raise ValueError("model id must be 1-128 characters of [A-Za-z0-9._-]")
+    return val_str
+
+
+def configured_fallback_model(pool=None):
+    """Return (setting, source): setting is None, "off" or a model id; source is env, config or default."""
+    env_val = os.environ.get(FALLBACK_MODEL_ENV)
+    if env_val is not None and env_val.strip() != "":
+        try:
+            return (normalize_fallback_model_setting(env_val), "env")
+        except ValueError:
+            pass
+
+    target_pool = pool
+    if target_pool is None:
+        try:
+            target_pool = _read_pool_unlocked()
+        except Exception:
+            target_pool = {}
+
+    val = None
+    if isinstance(target_pool, dict) and target_pool.get("fallback_model") is not None:
+        try:
+            val = normalize_fallback_model_setting(target_pool.get("fallback_model"))
+        except ValueError:
+            val = None
+    if val:
+        return (val, "config")
+    return (None, "default")
+
+
+def resolve_fallback_model(pool=None):
+    """Effective fallback model (family or full id), or None when disabled."""
+    setting = configured_fallback_model(pool)[0]
+    if setting == "off":
+        return None
+    return setting or DEFAULT_FALLBACK_MODEL
+
+
+def describe_fallback_model(pool=None):
+    setting, source = configured_fallback_model(pool)
+    if setting == "off":
+        text = "off (pass model-unavailable errors through)"
+    elif setting is None:
+        text = f"auto ({DEFAULT_FALLBACK_MODEL}, tier matched to the requested thinking level)"
+    else:
+        text = setting
+    if source == "env":
+        text += f" [{FALLBACK_MODEL_ENV} env]"
+    return text
+
+
+def _fallback_tier(model, thinking_level):
+    level = str(thinking_level or "").strip().lower()
+    if level in ("xhigh", "max", "maximum"):
+        return "high"
+    if level in FALLBACK_MODEL_TIERS:
+        return level
+    match = re.search(r"-(low|medium|high|xhigh)$", str(model or ""))
+    if match:
+        return "high" if match.group(1) == "xhigh" else match.group(1)
+    return "medium"
+
+
+def build_fallback_request(body, fallback):
+    """
+    Rewrite a generation payload to use the fallback model.
+    Returns (new_body, original_model, fallback_model), or None when not applicable.
+    """
+    if not body or not fallback:
+        return None
+    try:
+        payload = json.loads(body)
+    except (ValueError, UnicodeDecodeError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    original = payload.get("model")
+    if not isinstance(original, str) or not original:
+        return None
+
+    tier_match = re.fullmatch(r"(.+)-(low|medium|high)", fallback)
+    family = tier_match.group(1) if tier_match else fallback
+    if original == family or original.startswith(family + "-"):
+        return None
+
+    request = payload.get("request")
+    gen_config = request.get("generationConfig") if isinstance(request, dict) else None
+    thinking = gen_config.get("thinkingConfig") if isinstance(gen_config, dict) else None
+    level = thinking.get("thinkingLevel") if isinstance(thinking, dict) else None
+
+    tier = tier_match.group(2) if tier_match else _fallback_tier(original, level)
+    target = fallback if tier_match else f"{family}-{tier}"
+    payload["model"] = target
+    if isinstance(level, str) and level:
+        thinking["thinkingLevel"] = tier.upper()
+    if isinstance(gen_config, dict):
+        max_tokens = gen_config.get("maxOutputTokens")
+        if isinstance(max_tokens, int) and max_tokens > FALLBACK_MAX_OUTPUT_TOKENS:
+            gen_config["maxOutputTokens"] = FALLBACK_MAX_OUTPUT_TOKENS
+    return (json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8"), original, target)
+
+
+def _account_key(account):
+    return account.get("id") or account.get("email") or ""
+
+
+def is_model_unavailable(account, model, now=None):
+    key = (_account_key(account), model)
+    now = time.time() if now is None else now
+    with _MODEL_UNAVAILABLE_LOCK:
+        expiry = _MODEL_UNAVAILABLE.get(key)
+        if expiry is None:
+            return False
+        if expiry <= now:
+            _MODEL_UNAVAILABLE.pop(key, None)
+            return False
+        return True
+
+
+def mark_model_unavailable(account, model, now=None):
+    now = time.time() if now is None else now
+    with _MODEL_UNAVAILABLE_LOCK:
+        _MODEL_UNAVAILABLE[(_account_key(account), model)] = now + MODEL_UNAVAILABLE_TTL
 
 
 def _find_account(pool, account):
@@ -2700,11 +2848,13 @@ def manage_config(key=None, value=None):
         print(f"  • {CLR_CYAN}strategy{CLR_RESET}:     {strategy}")
         print(f"  • {CLR_CYAN}top_interval{CLR_RESET}: {pool.get('top_interval', 2.0):.1f}s")
         print(f"  • {CLR_CYAN}user_agent{CLR_RESET}:   {describe_user_agent(pool)}")
+        print(f"  • {CLR_CYAN}fallback_model{CLR_RESET}: {describe_fallback_model(pool)}")
         print(f"\nUsage:")
         print(f"  agy-pool config show_email <true|false|on|off>")
         print(f"  agy-pool config strategy <max_quota|round_robin|least_used>")
         print(f"  agy-pool config top_interval <seconds (0.5 - 60.0)>")
-        print(f"  agy-pool config user_agent <auto|desktop|\"custom UA string\">\n")
+        print(f"  agy-pool config user_agent <auto|desktop|\"custom UA string\">")
+        print(f"  agy-pool config fallback_model <auto|off|model-id>\n")
         return
 
     k = key.strip().lower().replace("-", "_")
@@ -2777,9 +2927,31 @@ def manage_config(key=None, value=None):
         env_val = os.environ.get(USER_AGENT_ENV)
         if env_val and env_val.strip():
             print(f"{CLR_YELLOW}Note: AGY_USER_AGENT environment variable is set and overrides pool configuration.{CLR_RESET}")
+    elif k in ("fallback_model", "fallback"):
+        if value is None:
+            print(f"fallback_model: {describe_fallback_model(pool)}")
+            return
+
+        try:
+            val = normalize_fallback_model_setting(value)
+        except ValueError as e:
+            print(f"{CLR_RED}[Error] Invalid fallback model: {e}{CLR_RESET}")
+            sys.exit(1)
+
+        def update(p):
+            if val is None:
+                p.pop("fallback_model", None)
+            else:
+                p["fallback_model"] = val
+        pool_transaction(update)
+        print(f"{CLR_GREEN}✓ Configuration updated: fallback_model = {describe_fallback_model(load_pool())}{CLR_RESET}")
+
+        env_val = os.environ.get(FALLBACK_MODEL_ENV)
+        if env_val and env_val.strip():
+            print(f"{CLR_YELLOW}Note: {FALLBACK_MODEL_ENV} environment variable is set and overrides pool configuration.{CLR_RESET}")
     else:
         print(f"{CLR_RED}[Error] Unknown configuration key: {key}{CLR_RESET}")
-        print("Supported keys: show_email, strategy, top_interval, user_agent")
+        print("Supported keys: show_email, strategy, top_interval, user_agent, fallback_model")
         sys.exit(1)
 
 
@@ -4702,7 +4874,18 @@ class SmartProxyHandler(http.server.BaseHTTPRequestHandler):
         last_error = None
         client_ua = resolve_user_agent(self.headers.get("User-Agent", ""), pool)
 
-        for acc in candidates:
+        fallback_req = None
+        if is_generation and self.command == "POST":
+            fallback_req = build_fallback_request(body, resolve_fallback_model(pool))
+        forced_fallback = set()
+
+        pending = list(candidates)
+        while pending:
+            acc = pending.pop(0)
+            use_fallback = fallback_req is not None and (
+                _account_key(acc) in forced_fallback or is_model_unavailable(acc, fallback_req[1]))
+            send_body = fallback_req[0] if use_fallback else body
+            model_note = f" [model fallback {fallback_req[1]} -> {fallback_req[2]}]" if use_fallback else ""
             try:
                 at = refresh_token(acc)
             except Exception as e:
@@ -4718,11 +4901,11 @@ class SmartProxyHandler(http.server.BaseHTTPRequestHandler):
             target_url = f"{BACKEND_URL_BASE}{path}"
             headers = self._request_headers(at, client_ua)
 
-            if self.command == "POST" and len(body) == 0:
+            if self.command == "POST" and len(send_body) == 0:
                 headers["Content-Length"] = "0"
                 req_data = b""
             else:
-                req_data = body if body else None
+                req_data = send_body if send_body else None
 
             req = urllib.request.Request(target_url, data=req_data, headers=headers, method=self.command)
 
@@ -4730,7 +4913,7 @@ class SmartProxyHandler(http.server.BaseHTTPRequestHandler):
                 with track_in_flight_generation(acc.get("id")) if is_generation else contextlib.nullcontext():
                     with urllib.request.urlopen(req, timeout=300) as resp:
                         status = resp.status
-                        sys.stderr.write(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [PROXY] {self.command} {path.split('/')[-1]} -> {display_account_name(acc)} (Status: {status})\n")
+                        sys.stderr.write(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [PROXY] {self.command} {path.split('/')[-1]} -> {display_account_name(acc)} (Status: {status}){model_note}\n")
                         sys.stderr.flush()
 
                         resp_content_type = str(resp.headers.get("Content-Type", "")).lower()
@@ -4757,8 +4940,17 @@ class SmartProxyHandler(http.server.BaseHTTPRequestHandler):
                     pass
                 finally:
                     e.close()
-                sys.stderr.write(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [PROXY ERROR] {self.command} {path.split('/')[-1]} -> {display_account_name(acc)} HTTP {e.code}\n")
+                sys.stderr.write(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [PROXY ERROR] {self.command} {path.split('/')[-1]} -> {display_account_name(acc)} HTTP {e.code}{model_note}\n")
                 sys.stderr.flush()
+
+                # Model not enabled for this account: retry the same account on the fallback model
+                if e.code == 404 and fallback_req is not None and not use_fallback:
+                    mark_model_unavailable(acc, fallback_req[1])
+                    forced_fallback.add(_account_key(acc))
+                    pending.insert(0, acc)
+                    sys.stderr.write(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [MODEL FALLBACK] Account {display_account_name(acc)} cannot use {fallback_req[1]} (HTTP 404)! Retrying with {fallback_req[2]} (cached {MODEL_UNAVAILABLE_TTL // 60}m)...\n")
+                    sys.stderr.flush()
+                    continue
 
                 # Failover on Google Security Validation Required
                 if _is_validation_error(e.code, err_body):
@@ -5317,8 +5509,8 @@ def main():
     top_p.add_argument("--show-email", dest="show_email", action="store_true", default=None, help="Display real email addresses")
     top_p.add_argument("--hide-email", dest="show_email", action="store_false", help="Hide real email addresses")
     # config
-    cfg_p = subparsers.add_parser("config", help="View or update pool configuration settings (e.g. show_email, strategy, user_agent)")
-    cfg_p.add_argument("key", nargs="?", default=None, help="Configuration key (show_email, strategy, user_agent)")
+    cfg_p = subparsers.add_parser("config", help="View or update pool configuration settings (e.g. show_email, strategy, user_agent, fallback_model)")
+    cfg_p.add_argument("key", nargs="?", default=None, help="Configuration key (show_email, strategy, user_agent, fallback_model)")
     cfg_p.add_argument("value", nargs="*", default=None, help="Value to set (e.g. true/false, desktop)")
     subparsers.add_parser("version", help="Show version information")
     subparsers.add_parser("daemon-run", help=argparse.SUPPRESS)  # Internal daemon worker

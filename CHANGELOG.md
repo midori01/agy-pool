@@ -5,6 +5,16 @@ All notable changes to the `agy-pool` project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.0-beta.13] - 2026-11-20
+
+### Added
+- **Per-Account Model Fallback on HTTP 404 (`fallback_model`)**:
+  - When a rotated account answers a generation request with HTTP 404 (`NOT_FOUND`, model not enabled for that account), the gateway now retries the same account with a fallback model instead of failing the agy session. Accounts that can use the requested model are never rewritten.
+  - Default fallback is `gemini-3.8-flash` with the tier matched to the requested thinking level (`LOW` / `MEDIUM` / `HIGH`, `XHIGH` maps to `high`); `thinkingLevel` is rewritten to match and `maxOutputTokens` is capped at 65536.
+  - The 404 is cached per account and model for 60 minutes, so later requests on that account skip the failing round trip.
+  - Added `agy-pool config fallback_model <auto|off|model-id>` (alias `fallback`) and the `AGY_FALLBACK_MODEL` environment override; proxy log lines mark rewritten requests with `[model fallback A -> B]`.
+  - Added unit tests for payload rewriting, configuration, same-account retry with caching, capable accounts, and `off` pass-through (136/136 passing).
+
 ## [0.1.0-beta.12] - 2026-10-23
 
 ### Added

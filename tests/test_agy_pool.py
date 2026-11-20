@@ -136,6 +136,7 @@ class AgyPoolTest(unittest.TestCase):
         agy_pool.FILE_LOCKS.clear()
         agy_pool._QUOTA_REFRESH_IN_FLIGHT.clear()
         agy_pool._QUOTA_REFRESH_RETRY.clear()
+        agy_pool._MODEL_UNAVAILABLE.clear()
         self.refresh_patch = mock.patch.object(agy_pool, "schedule_quota_refresh")
         self.refresh_mock = self.refresh_patch.start()
         self.addCleanup(self.refresh_patch.stop)
@@ -3590,6 +3591,146 @@ class AgyPoolTest(unittest.TestCase):
 
             self.assertEqual(len(captured_requests), 1)
             self.assertEqual(captured_requests[0].get_header("User-agent"), agy_pool.DEFAULT_UA)
+
+
+    def _gen_payload(self, model="gemini-4-neon-medium", level="MEDIUM", max_tokens=262144):
+        return {
+            "model": model,
+            "project": "p",
+            "requestId": "r",
+            "request": {
+                "contents": [{"role": "user", "parts": [{"text": "hi"}]}],
+                "generationConfig": {
+                    "maxOutputTokens": max_tokens,
+                    "thinkingConfig": {"includeThoughts": True, "thinkingLevel": level},
+                },
+            },
+        }
+
+    def test_build_fallback_request(self):
+        body = json.dumps(self._gen_payload()).encode()
+        new_body, original, target = agy_pool.build_fallback_request(body, "gemini-3.8-flash")
+        self.assertEqual((original, target), ("gemini-4-neon-medium", "gemini-3.8-flash-medium"))
+        data = json.loads(new_body)
+        self.assertEqual(data["model"], "gemini-3.8-flash-medium")
+        self.assertEqual(data["request"]["generationConfig"]["maxOutputTokens"], 65536)
+        self.assertEqual(data["request"]["generationConfig"]["thinkingConfig"]["thinkingLevel"], "MEDIUM")
+        self.assertEqual(data["request"]["contents"], self._gen_payload()["request"]["contents"])
+
+        xhigh = json.dumps(self._gen_payload("gemini-4-neon-xhigh", "XHIGH", 1000)).encode()
+        new_body, _, target = agy_pool.build_fallback_request(xhigh, "gemini-3.8-flash")
+        self.assertEqual(target, "gemini-3.8-flash-high")
+        data = json.loads(new_body)
+        self.assertEqual(data["request"]["generationConfig"]["thinkingConfig"]["thinkingLevel"], "HIGH")
+        self.assertEqual(data["request"]["generationConfig"]["maxOutputTokens"], 1000)
+
+        explicit = agy_pool.build_fallback_request(body, "gemini-3.8-flash-low")
+        self.assertEqual(explicit[2], "gemini-3.8-flash-low")
+        self.assertEqual(json.loads(explicit[0])["request"]["generationConfig"]["thinkingConfig"]["thinkingLevel"], "LOW")
+
+        flash = json.dumps(self._gen_payload("gemini-3.8-flash-high", "HIGH")).encode()
+        self.assertIsNone(agy_pool.build_fallback_request(flash, "gemini-3.8-flash"))
+        self.assertIsNone(agy_pool.build_fallback_request(flash, "gemini-3.8-flash-medium"))
+        self.assertIsNone(agy_pool.build_fallback_request(b"not json", "gemini-3.8-flash"))
+        self.assertIsNone(agy_pool.build_fallback_request(b'{"request": {}}', "gemini-3.8-flash"))
+        self.assertIsNone(agy_pool.build_fallback_request(body, None))
+
+    def test_fallback_model_setting(self):
+        with mock.patch.dict(os.environ):
+            os.environ.pop("AGY_FALLBACK_MODEL", None)
+            self.save_accounts([account("a")])
+            self.assertEqual(agy_pool.resolve_fallback_model(), "gemini-3.8-flash")
+
+            buf = io.StringIO()
+            with mock.patch("sys.stdout", buf):
+                agy_pool.manage_config("fallback_model", "off")
+            self.assertEqual(agy_pool.load_pool().get("fallback_model"), "off")
+            self.assertIsNone(agy_pool.resolve_fallback_model())
+
+            with mock.patch("sys.stdout", io.StringIO()):
+                agy_pool.manage_config("fallback", "gemini-3.8-flash-high")
+            self.assertEqual(agy_pool.resolve_fallback_model(), "gemini-3.8-flash-high")
+
+            buf = io.StringIO()
+            with mock.patch("sys.stdout", buf):
+                with self.assertRaises(SystemExit):
+                    agy_pool.manage_config("fallback_model", "bad model\r\n")
+            self.assertIn("[Error] Invalid fallback model", buf.getvalue())
+            self.assertEqual(agy_pool.load_pool().get("fallback_model"), "gemini-3.8-flash-high")
+
+            with mock.patch("sys.stdout", io.StringIO()):
+                agy_pool.manage_config("fallback_model", "auto")
+            self.assertNotIn("fallback_model", agy_pool.load_pool())
+
+            os.environ["AGY_FALLBACK_MODEL"] = "off"
+            self.assertIsNone(agy_pool.resolve_fallback_model())
+
+    def _capture(self, bodies, status, payload=b"ok"):
+        def action(handler):
+            bodies.append(json.loads(handler.body))
+            handler.send_response(status)
+            handler.send_header("Content-Length", str(len(payload)))
+            handler.send_header("Connection", "close")
+            handler.end_headers()
+            handler.wfile.write(payload)
+        return action
+
+    def test_proxy_model_404_falls_back_on_same_account_and_caches(self):
+        with mock.patch.dict(os.environ):
+            os.environ.pop("AGY_FALLBACK_MODEL", None)
+            self.save_accounts([account("b")], active="b")
+            bodies = []
+            not_found = b'{"error":{"code":404,"message":"Requested entity was not found.","status":"NOT_FOUND"}}'
+            scenario = Scenario({"token-b": [
+                self._capture(bodies, 404, not_found),
+                self._capture(bodies, 200, b"flash-1"),
+                self._capture(bodies, 200, b"flash-2"),
+            ]})
+            proxy = self.start_proxy(scenario)
+            path = "/v1internal:streamGenerateContent?alt=sse"
+            req = json.dumps(self._gen_payload()).encode()
+
+            status, data, _ = self.request(proxy, path=path, body=req)
+            self.assertEqual((status, data), (200, b"flash-1"))
+            self.assertEqual([b["model"] for b in bodies], ["gemini-4-neon-medium", "gemini-3.8-flash-medium"])
+            self.assertEqual(bodies[1]["request"]["generationConfig"]["maxOutputTokens"], 65536)
+            self.assertTrue(agy_pool.is_model_unavailable(account("b"), "gemini-4-neon-medium"))
+
+            status, data, _ = self.request(proxy, path=path, body=req)
+            self.assertEqual((status, data), (200, b"flash-2"))
+            self.assertEqual(len(bodies), 3)
+            self.assertEqual(bodies[2]["model"], "gemini-3.8-flash-medium")
+
+            self.assertFalse(agy_pool.is_model_unavailable(account("b"), "gemini-4-neon-medium",
+                                                            now=time.time() + agy_pool.MODEL_UNAVAILABLE_TTL + 1))
+
+    def test_proxy_model_fallback_keeps_capable_account_and_respects_off(self):
+        with mock.patch.dict(os.environ):
+            os.environ.pop("AGY_FALLBACK_MODEL", None)
+            self.save_accounts([account("a")])
+            bodies = []
+            scenario = Scenario({"token-a": [self._capture(bodies, 200, b"neon")]})
+            proxy = self.start_proxy(scenario)
+            req = json.dumps(self._gen_payload()).encode()
+            status, data, _ = self.request(proxy, path="/v1internal:streamGenerateContent?alt=sse", body=req)
+            self.assertEqual((status, data), (200, b"neon"))
+            self.assertEqual([b["model"] for b in bodies], ["gemini-4-neon-medium"])
+
+            agy_pool.pool_transaction(lambda p: p.update(fallback_model="off"))
+            bodies2 = []
+            scenario2 = Scenario({"token-a": [self._capture(bodies2, 404, b"nf"), self._capture(bodies2, 200, b"x")]})
+            proxy2 = self.start_proxy(scenario2)
+            status, data, _ = self.request(proxy2, path="/v1internal:streamGenerateContent?alt=sse", body=req)
+            self.assertEqual((status, data), (404, b"nf"))
+            self.assertEqual(len(bodies2), 1)
+
+            agy_pool.pool_transaction(lambda p: p.pop("fallback_model", None))
+            bodies3 = []
+            scenario3 = Scenario({"token-a": [self._capture(bodies3, 404, b"nf")]})
+            proxy3 = self.start_proxy(scenario3)
+            status, _, _ = self.request(proxy3, path="/v1internal:loadCodeAssist", body=req)
+            self.assertEqual(status, 404)
+            self.assertEqual(len(bodies3), 1)
 
 
 if __name__ == "__main__":
