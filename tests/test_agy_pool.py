@@ -137,6 +137,8 @@ class AgyPoolTest(unittest.TestCase):
         agy_pool._QUOTA_REFRESH_IN_FLIGHT.clear()
         agy_pool._QUOTA_REFRESH_RETRY.clear()
         agy_pool._MODEL_UNAVAILABLE.clear()
+        agy_pool._ACCOUNT_MODELS.clear()
+        agy_pool._MODEL_MAX_OUTPUT.clear()
         self.refresh_patch = mock.patch.object(agy_pool, "schedule_quota_refresh")
         self.refresh_mock = self.refresh_patch.start()
         self.addCleanup(self.refresh_patch.stop)
@@ -3609,37 +3611,57 @@ class AgyPoolTest(unittest.TestCase):
 
     def test_build_fallback_request(self):
         body = json.dumps(self._gen_payload()).encode()
-        new_body, original, target = agy_pool.build_fallback_request(body, "gemini-3.8-flash")
-        self.assertEqual((original, target), ("gemini-4-neon-medium", "gemini-3.8-flash-medium"))
+        new_body, original, target = agy_pool.build_fallback_request(body, "gemini-4-hydrogen")
+        self.assertEqual((original, target), ("gemini-4-neon-medium", "gemini-4-hydrogen-medium"))
         data = json.loads(new_body)
-        self.assertEqual(data["model"], "gemini-3.8-flash-medium")
-        self.assertEqual(data["request"]["generationConfig"]["maxOutputTokens"], 65536)
+        self.assertEqual(data["model"], "gemini-4-hydrogen-medium")
+        self.assertEqual(data["request"]["generationConfig"]["maxOutputTokens"], 262144)
         self.assertEqual(data["request"]["generationConfig"]["thinkingConfig"]["thinkingLevel"], "MEDIUM")
         self.assertEqual(data["request"]["contents"], self._gen_payload()["request"]["contents"])
 
+        agy_pool._MODEL_MAX_OUTPUT["gemini-4-hydrogen-medium"] = 1000
+        capped_body, _, _ = agy_pool.build_fallback_request(body, "gemini-4-hydrogen")
+        self.assertEqual(json.loads(capped_body)["request"]["generationConfig"]["maxOutputTokens"], 1000)
+        agy_pool._MODEL_MAX_OUTPUT.clear()
+
         xhigh = json.dumps(self._gen_payload("gemini-4-neon-xhigh", "XHIGH", 1000)).encode()
-        new_body, _, target = agy_pool.build_fallback_request(xhigh, "gemini-3.8-flash")
-        self.assertEqual(target, "gemini-3.8-flash-high")
+        new_body, _, target = agy_pool.build_fallback_request(xhigh, "gemini-4-hydrogen")
+        self.assertEqual(target, "gemini-4-hydrogen-xhigh")
         data = json.loads(new_body)
-        self.assertEqual(data["request"]["generationConfig"]["thinkingConfig"]["thinkingLevel"], "HIGH")
+        self.assertEqual(data["request"]["generationConfig"]["thinkingConfig"]["thinkingLevel"], "XHIGH")
         self.assertEqual(data["request"]["generationConfig"]["maxOutputTokens"], 1000)
 
-        explicit = agy_pool.build_fallback_request(body, "gemini-3.8-flash-low")
-        self.assertEqual(explicit[2], "gemini-3.8-flash-low")
-        self.assertEqual(json.loads(explicit[0])["request"]["generationConfig"]["thinkingConfig"]["thinkingLevel"], "LOW")
+        new_body_dropped, _, target_dropped = agy_pool.build_fallback_request(
+            xhigh, "gemini-4-hydrogen", available=frozenset({"gemini-4-hydrogen-high"})
+        )
+        self.assertEqual(target_dropped, "gemini-4-hydrogen-high")
+        self.assertEqual(json.loads(new_body_dropped)["request"]["generationConfig"]["thinkingConfig"]["thinkingLevel"], "HIGH")
 
-        flash = json.dumps(self._gen_payload("gemini-3.8-flash-high", "HIGH")).encode()
-        self.assertIsNone(agy_pool.build_fallback_request(flash, "gemini-3.8-flash"))
-        self.assertIsNone(agy_pool.build_fallback_request(flash, "gemini-3.8-flash-medium"))
-        self.assertIsNone(agy_pool.build_fallback_request(b"not json", "gemini-3.8-flash"))
-        self.assertIsNone(agy_pool.build_fallback_request(b'{"request": {}}', "gemini-3.8-flash"))
+        explicit_low = agy_pool.build_fallback_request(body, "gemini-4-hydrogen-low")
+        self.assertEqual(explicit_low[2], "gemini-4-hydrogen-low")
+        self.assertEqual(json.loads(explicit_low[0])["request"]["generationConfig"]["thinkingConfig"]["thinkingLevel"], "LOW")
+
+        explicit_xhigh = agy_pool.build_fallback_request(body, "gemini-4-hydrogen-xhigh")
+        self.assertEqual(explicit_xhigh[2], "gemini-4-hydrogen-xhigh")
+        self.assertEqual(json.loads(explicit_xhigh[0])["request"]["generationConfig"]["thinkingConfig"]["thinkingLevel"], "XHIGH")
+
+        hydrogen = json.dumps(self._gen_payload("gemini-4-hydrogen-high", "HIGH")).encode()
+        self.assertIsNone(agy_pool.build_fallback_request(hydrogen, "gemini-4-hydrogen"))
+        self.assertIsNone(agy_pool.build_fallback_request(hydrogen, "gemini-4-hydrogen-medium"))
+
+        flash_body, _, flash_target = agy_pool.build_fallback_request(body, "gemini-3.8-flash")
+        self.assertEqual(flash_target, "gemini-3.8-flash-medium")
+        self.assertEqual(json.loads(flash_body)["model"], "gemini-3.8-flash-medium")
+
+        self.assertIsNone(agy_pool.build_fallback_request(b"not json", "gemini-4-hydrogen"))
+        self.assertIsNone(agy_pool.build_fallback_request(b'{"request": {}}', "gemini-4-hydrogen"))
         self.assertIsNone(agy_pool.build_fallback_request(body, None))
 
     def test_fallback_model_setting(self):
         with mock.patch.dict(os.environ):
             os.environ.pop("AGY_FALLBACK_MODEL", None)
             self.save_accounts([account("a")])
-            self.assertEqual(agy_pool.resolve_fallback_model(), "gemini-3.8-flash")
+            self.assertEqual(agy_pool.resolve_fallback_model(), "gemini-4-hydrogen")
 
             buf = io.StringIO()
             with mock.patch("sys.stdout", buf):
@@ -3648,15 +3670,15 @@ class AgyPoolTest(unittest.TestCase):
             self.assertIsNone(agy_pool.resolve_fallback_model())
 
             with mock.patch("sys.stdout", io.StringIO()):
-                agy_pool.manage_config("fallback", "gemini-3.8-flash-high")
-            self.assertEqual(agy_pool.resolve_fallback_model(), "gemini-3.8-flash-high")
+                agy_pool.manage_config("fallback", "gemini-4-hydrogen-high")
+            self.assertEqual(agy_pool.resolve_fallback_model(), "gemini-4-hydrogen-high")
 
             buf = io.StringIO()
             with mock.patch("sys.stdout", buf):
                 with self.assertRaises(SystemExit):
                     agy_pool.manage_config("fallback_model", "bad model\r\n")
             self.assertIn("[Error] Invalid fallback model", buf.getvalue())
-            self.assertEqual(agy_pool.load_pool().get("fallback_model"), "gemini-3.8-flash-high")
+            self.assertEqual(agy_pool.load_pool().get("fallback_model"), "gemini-4-hydrogen-high")
 
             with mock.patch("sys.stdout", io.StringIO()):
                 agy_pool.manage_config("fallback_model", "auto")
@@ -3679,27 +3701,31 @@ class AgyPoolTest(unittest.TestCase):
         with mock.patch.dict(os.environ):
             os.environ.pop("AGY_FALLBACK_MODEL", None)
             self.save_accounts([account("b")], active="b")
+            agy_pool._ACCOUNT_MODELS["b"] = (
+                time.time() + 600,
+                frozenset({"gemini-4-neon-disabled", "gemini-4-hydrogen-medium"}),
+            )
             bodies = []
             not_found = b'{"error":{"code":404,"message":"Requested entity was not found.","status":"NOT_FOUND"}}'
             scenario = Scenario({"token-b": [
                 self._capture(bodies, 404, not_found),
-                self._capture(bodies, 200, b"flash-1"),
-                self._capture(bodies, 200, b"flash-2"),
+                self._capture(bodies, 200, b"hydrogen-1"),
+                self._capture(bodies, 200, b"hydrogen-2"),
             ]})
             proxy = self.start_proxy(scenario)
             path = "/v1internal:streamGenerateContent?alt=sse"
             req = json.dumps(self._gen_payload()).encode()
 
             status, data, _ = self.request(proxy, path=path, body=req)
-            self.assertEqual((status, data), (200, b"flash-1"))
-            self.assertEqual([b["model"] for b in bodies], ["gemini-4-neon-medium", "gemini-3.8-flash-medium"])
-            self.assertEqual(bodies[1]["request"]["generationConfig"]["maxOutputTokens"], 65536)
+            self.assertEqual((status, data), (200, b"hydrogen-1"))
+            self.assertEqual([b["model"] for b in bodies], ["gemini-4-neon-medium", "gemini-4-hydrogen-medium"])
+            self.assertEqual(bodies[1]["request"]["generationConfig"]["maxOutputTokens"], 262144)
             self.assertTrue(agy_pool.is_model_unavailable(account("b"), "gemini-4-neon-medium"))
 
             status, data, _ = self.request(proxy, path=path, body=req)
-            self.assertEqual((status, data), (200, b"flash-2"))
+            self.assertEqual((status, data), (200, b"hydrogen-2"))
             self.assertEqual(len(bodies), 3)
-            self.assertEqual(bodies[2]["model"], "gemini-3.8-flash-medium")
+            self.assertEqual(bodies[2]["model"], "gemini-4-hydrogen-medium")
 
             self.assertFalse(agy_pool.is_model_unavailable(account("b"), "gemini-4-neon-medium",
                                                             now=time.time() + agy_pool.MODEL_UNAVAILABLE_TTL + 1))
@@ -3716,6 +3742,7 @@ class AgyPoolTest(unittest.TestCase):
             self.assertEqual((status, data), (200, b"neon"))
             self.assertEqual([b["model"] for b in bodies], ["gemini-4-neon-medium"])
 
+            agy_pool._ACCOUNT_MODELS["a"] = (time.time() + 600, frozenset({"gemini-4-neon-disabled"}))
             agy_pool.pool_transaction(lambda p: p.update(fallback_model="off"))
             bodies2 = []
             scenario2 = Scenario({"token-a": [self._capture(bodies2, 404, b"nf"), self._capture(bodies2, 200, b"x")]})
@@ -3731,6 +3758,157 @@ class AgyPoolTest(unittest.TestCase):
             status, _, _ = self.request(proxy3, path="/v1internal:loadCodeAssist", body=req)
             self.assertEqual(status, 404)
             self.assertEqual(len(bodies3), 1)
+
+    def test_proxy_transient_404_retries_on_next_account(self):
+        with mock.patch.dict(os.environ):
+            os.environ.pop("AGY_FALLBACK_MODEL", None)
+            self.save_accounts([account("a"), account("b")], active="a")
+            for acc_id in ("a", "b"):
+                agy_pool._ACCOUNT_MODELS[acc_id] = (time.time() + 600, frozenset({"gemini-4-neon-medium"}))
+
+            bodies = []
+            not_found = b'{"error":{"code":404,"message":"Requested entity was not found.","status":"NOT_FOUND"}}'
+            actions = [
+                self._capture(bodies, 404, not_found),
+                self._capture(bodies, 200, b"ok-next"),
+            ]
+
+            def dispatch(handler):
+                actions.pop(0)(handler)
+
+            scenario = Scenario({"*": [dispatch, dispatch]})
+            proxy = self.start_proxy(scenario)
+            req = json.dumps(self._gen_payload()).encode()
+
+            err_buf = io.StringIO()
+            with mock.patch("sys.stderr", err_buf):
+                status, data, _ = self.request(proxy, path="/v1internal:streamGenerateContent?alt=sse", body=req)
+
+            self.assertEqual((status, data), (200, b"ok-next"))
+            self.assertEqual([b["model"] for b in bodies], ["gemini-4-neon-medium", "gemini-4-neon-medium"])
+            self.assertFalse(agy_pool.is_model_unavailable(account("a"), "gemini-4-neon-medium"))
+            self.assertFalse(agy_pool.is_model_unavailable(account("b"), "gemini-4-neon-medium"))
+            logs = err_buf.getvalue()
+            self.assertIn("[TRANSIENT 404]", logs)
+            self.assertIn("Requested entity was not found.", logs)
+
+    def test_proxy_transient_404_caps_retries_and_passes_through(self):
+        with mock.patch.dict(os.environ):
+            os.environ.pop("AGY_FALLBACK_MODEL", None)
+            accounts = [account(acc_id) for acc_id in ("a", "b", "c", "d")]
+            self.save_accounts(accounts, active="a")
+            for acc_id in ("a", "b", "c", "d"):
+                agy_pool._ACCOUNT_MODELS[acc_id] = (time.time() + 600, frozenset({"gemini-4-neon-medium"}))
+
+            bodies = []
+            not_found = b'{"error":{"code":404,"message":"Requested entity was not found.","status":"NOT_FOUND"}}'
+            scenario = Scenario({"*": [self._capture(bodies, 404, not_found) for _ in range(4)]})
+            proxy = self.start_proxy(scenario)
+            req = json.dumps(self._gen_payload()).encode()
+
+            status, _, _ = self.request(proxy, path="/v1internal:streamGenerateContent?alt=sse", body=req)
+            self.assertEqual(status, 404)
+            self.assertEqual(len(bodies), 1 + agy_pool.TRANSIENT_404_RETRIES)
+            for acc in accounts:
+                self.assertFalse(agy_pool.is_model_unavailable(acc, "gemini-4-neon-medium"))
+
+    def test_proxy_live_model_list_populates_cache_and_caps_output(self):
+        with mock.patch.dict(os.environ):
+            os.environ.pop("AGY_FALLBACK_MODEL", None)
+            self.save_accounts([account("a")], active="a")
+            gen_bodies = []
+            gen_statuses = [
+                (404, b'{"error":{"code":404,"message":"Not found","status":"NOT_FOUND"}}'),
+                (200, b"hydrogen-1"),
+                (200, b"hydrogen-2"),
+            ]
+            model_list = json.dumps({
+                "models": {
+                    "gemini-4-hydrogen-medium": {"maxOutputTokens": 1000},
+                    "gemini-4-neon-disabled": {},
+                }
+            }).encode()
+
+            def by_path(handler):
+                if "fetchAvailableModels" in handler.path:
+                    handler.send_response(200)
+                    handler.send_header("Content-Length", str(len(model_list)))
+                    handler.send_header("Connection", "close")
+                    handler.end_headers()
+                    handler.wfile.write(model_list)
+                else:
+                    status, payload = gen_statuses.pop(0)
+                    self._capture(gen_bodies, status, payload)(handler)
+
+            scenario = Scenario({"*": [by_path for _ in range(5)]})
+            proxy = self.start_proxy(scenario)
+            path = "/v1internal:streamGenerateContent?alt=sse"
+            req = json.dumps(self._gen_payload()).encode()
+
+            err_buf = io.StringIO()
+            with mock.patch("sys.stderr", err_buf):
+                status, data, _ = self.request(proxy, path=path, body=req)
+
+            self.assertEqual((status, data), (200, b"hydrogen-1"))
+            self.assertEqual([b["model"] for b in gen_bodies], ["gemini-4-neon-medium", "gemini-4-hydrogen-medium"])
+            self.assertEqual(gen_bodies[1]["request"]["generationConfig"]["maxOutputTokens"], 1000)
+            self.assertIn("gemini-4-hydrogen-medium", agy_pool.cached_account_models(account("a")))
+            self.assertIn("not in account model list", err_buf.getvalue())
+
+            fetch_calls_before = sum(1 for _, p, _ in scenario.calls if "fetchAvailableModels" in p)
+            self.assertEqual(fetch_calls_before, 1)
+
+            status, data, _ = self.request(proxy, path=path, body=req)
+            self.assertEqual((status, data), (200, b"hydrogen-2"))
+            self.assertEqual(len(gen_bodies), 3)
+            self.assertEqual(gen_bodies[2]["model"], "gemini-4-hydrogen-medium")
+            fetch_calls_after = sum(1 for _, p, _ in scenario.calls if "fetchAvailableModels" in p)
+            self.assertEqual(fetch_calls_after, 1)
+
+    def test_proxy_model_list_unavailable_still_falls_back(self):
+        with mock.patch.dict(os.environ):
+            os.environ.pop("AGY_FALLBACK_MODEL", None)
+            self.save_accounts([account("a")], active="a")
+            gen_bodies = []
+            gen_statuses = [(404, b"nf"), (200, b"hydrogen-ok")]
+
+            def by_path(handler):
+                if "fetchAvailableModels" in handler.path:
+                    handler.send_response(500)
+                    handler.send_header("Content-Length", "3")
+                    handler.send_header("Connection", "close")
+                    handler.end_headers()
+                    handler.wfile.write(b"err")
+                else:
+                    status, payload = gen_statuses.pop(0)
+                    self._capture(gen_bodies, status, payload)(handler)
+
+            scenario = Scenario({"*": [by_path for _ in range(4)]})
+            proxy = self.start_proxy(scenario)
+            req = json.dumps(self._gen_payload()).encode()
+
+            err_buf = io.StringIO()
+            with mock.patch("sys.stderr", err_buf):
+                status, data, _ = self.request(proxy, path="/v1internal:streamGenerateContent?alt=sse", body=req)
+
+            self.assertEqual((status, data), (200, b"hydrogen-ok"))
+            self.assertEqual([b["model"] for b in gen_bodies], ["gemini-4-neon-medium", "gemini-4-hydrogen-medium"])
+            self.assertIn("model list unavailable", err_buf.getvalue())
+
+    def test_proxy_fallback_model_request_404_not_rewritten(self):
+        with mock.patch.dict(os.environ):
+            os.environ.pop("AGY_FALLBACK_MODEL", None)
+            self.save_accounts([account("a")], active="a")
+            agy_pool._ACCOUNT_MODELS["a"] = (time.time() + 600, frozenset({"gemini-4-neon-medium"}))
+
+            bodies = []
+            scenario = Scenario({"*": [self._capture(bodies, 404, b"nf"), self._capture(bodies, 200, b"unused")]})
+            proxy = self.start_proxy(scenario)
+            req = json.dumps(self._gen_payload("gemini-4-hydrogen-medium", "MEDIUM")).encode()
+
+            status, data, _ = self.request(proxy, path="/v1internal:streamGenerateContent?alt=sse", body=req)
+            self.assertEqual((status, data), (404, b"nf"))
+            self.assertEqual([b["model"] for b in bodies], ["gemini-4-hydrogen-medium"])
 
 
 if __name__ == "__main__":

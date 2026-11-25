@@ -5,6 +5,20 @@ All notable changes to the `agy-pool` project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.0-beta.14] - 2026-11-25
+
+### Changed
+- **Default Fallback Model (`gemini-4-hydrogen`)**:
+  - Updated default fallback model from `gemini-3.8-flash` (which is being retired) to `gemini-4-hydrogen`.
+  - Added `xhigh` tier support (`XHIGH` / `MAX`), automatically dropping to `high` when an account's model list lacks `xhigh` but includes `high`.
+  - Replaced the fixed 65536 `maxOutputTokens` cap with the fallback model's advertised limit from `fetchAvailableModels` when known.
+
+### Fixed
+- **Transient HTTP 404 Handling & Diagnostics**:
+  - A 404 for a model listed in an account's `fetchAvailableModels` response (cached for 30 minutes) is no longer treated as missing entitlement: it is not cached for 60 minutes and instead retries on up to 2 other accounts before passing through.
+  - Proxy error logs now include a snippet of the 404 response body.
+  - Updated and expanded unit tests for hydrogen fallback, model list caching, and transient 404 retries (141/141 passing).
+
 ## [0.1.0-beta.13] - 2026-11-20
 
 ### Added

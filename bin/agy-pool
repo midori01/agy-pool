@@ -65,7 +65,7 @@ except ImportError:
     HAS_TERMIOS = False
 
 # ----------------- Constants & Configuration -----------------
-VERSION = "0.1.0-beta.13"
+VERSION = "0.1.0-beta.14"
 QUOTA_FRESH_MAX_AGE = 60
 QUOTA_AGING_MAX_AGE = 300
 _QUOTA_REFRESH_LOCK = threading.Lock()
@@ -187,16 +187,21 @@ DESKTOP_UA = f"antigravity/hub/{DESKTOP_HUB_VERSION} (aidev_client; os_type={OS_
 USER_AGENT_ENV = "AGY_USER_AGENT"
 USER_AGENT_MAX_LEN = 512
 
-# Generation requests that hit HTTP 404 (model not enabled for the account) are retried
-# on the same account with this model family; the tier follows the requested thinking level.
+# Generation requests that hit HTTP 404 on an account whose model list lacks the requested model
+# are retried on the same account with this model family; the tier follows the requested thinking level.
+# A 404 for a model the account does list is transient: the request moves to the next account instead.
 FALLBACK_MODEL_ENV = "AGY_FALLBACK_MODEL"
-DEFAULT_FALLBACK_MODEL = "gemini-3.8-flash"
+DEFAULT_FALLBACK_MODEL = "gemini-4-hydrogen"
 FALLBACK_MODEL_MAX_LEN = 128
-FALLBACK_MODEL_TIERS = ("low", "medium", "high")
-FALLBACK_MAX_OUTPUT_TOKENS = 65536
+FALLBACK_MODEL_TIERS = ("low", "medium", "high", "xhigh")
 MODEL_UNAVAILABLE_TTL = 3600
 _MODEL_UNAVAILABLE = {}
 _MODEL_UNAVAILABLE_LOCK = threading.Lock()
+ACCOUNT_MODELS_TTL = 1800
+TRANSIENT_404_RETRIES = 2
+_ACCOUNT_MODELS = {}
+_MODEL_MAX_OUTPUT = {}
+_ACCOUNT_MODELS_LOCK = threading.Lock()
 POOL_LOCK = threading.RLock()
 FILE_LOCKS = {}
 FILE_LOCKS_LOCK = threading.Lock()
@@ -638,19 +643,28 @@ def describe_fallback_model(pool=None):
 
 def _fallback_tier(model, thinking_level):
     level = str(thinking_level or "").strip().lower()
-    if level in ("xhigh", "max", "maximum"):
-        return "high"
+    if level in ("max", "maximum"):
+        return "xhigh"
     if level in FALLBACK_MODEL_TIERS:
         return level
     match = re.search(r"-(low|medium|high|xhigh)$", str(model or ""))
-    if match:
-        return "high" if match.group(1) == "xhigh" else match.group(1)
-    return "medium"
+    return match.group(1) if match else "medium"
 
 
-def build_fallback_request(body, fallback):
+def payload_model(body):
+    """The model id named by a generation payload, or None."""
+    try:
+        payload = json.loads(body) if body else None
+    except (ValueError, UnicodeDecodeError):
+        return None
+    model = payload.get("model") if isinstance(payload, dict) else None
+    return model if isinstance(model, str) and model else None
+
+
+def build_fallback_request(body, fallback, available=None):
     """
     Rewrite a generation payload to use the fallback model.
+    `available` is the account's model id set when known; an unlisted xhigh tier then drops to high.
     Returns (new_body, original_model, fallback_model), or None when not applicable.
     """
     if not body or not fallback:
@@ -665,7 +679,7 @@ def build_fallback_request(body, fallback):
     if not isinstance(original, str) or not original:
         return None
 
-    tier_match = re.fullmatch(r"(.+)-(low|medium|high)", fallback)
+    tier_match = re.fullmatch(r"(.+)-(low|medium|high|xhigh)", fallback)
     family = tier_match.group(1) if tier_match else fallback
     if original == family or original.startswith(family + "-"):
         return None
@@ -677,13 +691,17 @@ def build_fallback_request(body, fallback):
 
     tier = tier_match.group(2) if tier_match else _fallback_tier(original, level)
     target = fallback if tier_match else f"{family}-{tier}"
+    if (not tier_match and tier == "xhigh" and available is not None
+            and target not in available and f"{family}-high" in available):
+        tier, target = "high", f"{family}-high"
     payload["model"] = target
     if isinstance(level, str) and level:
         thinking["thinkingLevel"] = tier.upper()
-    if isinstance(gen_config, dict):
+    limit = _MODEL_MAX_OUTPUT.get(target)
+    if isinstance(gen_config, dict) and limit:
         max_tokens = gen_config.get("maxOutputTokens")
-        if isinstance(max_tokens, int) and max_tokens > FALLBACK_MAX_OUTPUT_TOKENS:
-            gen_config["maxOutputTokens"] = FALLBACK_MAX_OUTPUT_TOKENS
+        if isinstance(max_tokens, int) and max_tokens > limit:
+            gen_config["maxOutputTokens"] = limit
     return (json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8"), original, target)
 
 
@@ -708,6 +726,49 @@ def mark_model_unavailable(account, model, now=None):
     now = time.time() if now is None else now
     with _MODEL_UNAVAILABLE_LOCK:
         _MODEL_UNAVAILABLE[(_account_key(account), model)] = now + MODEL_UNAVAILABLE_TTL
+
+
+def cached_account_models(account, now=None):
+    """The account's cached model id set, or None when unknown or expired."""
+    now = time.time() if now is None else now
+    with _ACCOUNT_MODELS_LOCK:
+        hit = _ACCOUNT_MODELS.get(_account_key(account))
+    return hit[1] if hit and hit[0] > now else None
+
+
+def fetch_account_models(account, access_token, user_agent):
+    """Model ids the account can use (cached for ACCOUNT_MODELS_TTL), or None when the list is unavailable."""
+    cached = cached_account_models(account)
+    if cached is not None:
+        return cached
+    req = urllib.request.Request(
+        f"{BACKEND_URL_BASE}/v1internal:fetchAvailableModels",
+        data=b"{}",
+        headers={"Authorization": f"Bearer {access_token}", "Content-Type": "application/json",
+                 "User-Agent": user_agent},
+        method="POST"
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            models = json.loads(resp.read().decode()).get("models")
+    except Exception:
+        return None
+    if not isinstance(models, dict):
+        return None
+    ids = frozenset(models)
+    with _ACCOUNT_MODELS_LOCK:
+        _ACCOUNT_MODELS[_account_key(account)] = (time.time() + ACCOUNT_MODELS_TTL, ids)
+        for name, info in models.items():
+            limit = info.get("maxOutputTokens") if isinstance(info, dict) else None
+            if isinstance(limit, int) and limit > 0:
+                _MODEL_MAX_OUTPUT[name] = limit
+    return ids
+
+
+def _error_snippet(err_body, limit=200):
+    text = err_body.decode("utf-8", "replace") if isinstance(err_body, bytes) else str(err_body or "")
+    text = " ".join(text.split())
+    return text if len(text) <= limit else text[:limit] + "..."
 
 
 def _find_account(pool, account):
@@ -4874,18 +4935,25 @@ class SmartProxyHandler(http.server.BaseHTTPRequestHandler):
         last_error = None
         client_ua = resolve_user_agent(self.headers.get("User-Agent", ""), pool)
 
+        fallback = None
+        request_model = None
         fallback_req = None
         if is_generation and self.command == "POST":
-            fallback_req = build_fallback_request(body, resolve_fallback_model(pool))
+            fallback = resolve_fallback_model(pool)
+            request_model = payload_model(body)
+            fallback_req = build_fallback_request(body, fallback)
         forced_fallback = set()
+        transient_404s = 0
 
         pending = list(candidates)
         while pending:
             acc = pending.pop(0)
             use_fallback = fallback_req is not None and (
                 _account_key(acc) in forced_fallback or is_model_unavailable(acc, fallback_req[1]))
-            send_body = fallback_req[0] if use_fallback else body
-            model_note = f" [model fallback {fallback_req[1]} -> {fallback_req[2]}]" if use_fallback else ""
+            attempt_req = (build_fallback_request(body, fallback, cached_account_models(acc)) or fallback_req) if use_fallback else None
+            send_body = attempt_req[0] if use_fallback else body
+            sent_model = attempt_req[2] if use_fallback else request_model
+            model_note = f" [model fallback {attempt_req[1]} -> {attempt_req[2]}]" if use_fallback else ""
             try:
                 at = refresh_token(acc)
             except Exception as e:
@@ -4940,17 +5008,29 @@ class SmartProxyHandler(http.server.BaseHTTPRequestHandler):
                     pass
                 finally:
                     e.close()
-                sys.stderr.write(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [PROXY ERROR] {self.command} {path.split('/')[-1]} -> {display_account_name(acc)} HTTP {e.code}{model_note}\n")
+                gen_404 = e.code == 404 and request_model is not None
+                error_note = f": {_error_snippet(err_body)}" if gen_404 else ""
+                sys.stderr.write(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [PROXY ERROR] {self.command} {path.split('/')[-1]} -> {display_account_name(acc)} HTTP {e.code}{model_note}{error_note}\n")
                 sys.stderr.flush()
 
-                # Model not enabled for this account: retry the same account on the fallback model
-                if e.code == 404 and fallback_req is not None and not use_fallback:
-                    mark_model_unavailable(acc, fallback_req[1])
-                    forced_fallback.add(_account_key(acc))
-                    pending.insert(0, acc)
-                    sys.stderr.write(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [MODEL FALLBACK] Account {display_account_name(acc)} cannot use {fallback_req[1]} (HTTP 404)! Retrying with {fallback_req[2]} (cached {MODEL_UNAVAILABLE_TTL // 60}m)...\n")
-                    sys.stderr.flush()
-                    continue
+                if gen_404:
+                    available = fetch_account_models(acc, at, client_ua)
+                    if available is not None and sent_model in available:
+                        # The account lists the model, so this 404 is not an entitlement failure
+                        transient_404s += 1
+                        if transient_404s <= TRANSIENT_404_RETRIES and pending:
+                            sys.stderr.write(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [TRANSIENT 404] Account {display_account_name(acc)} lists {sent_model} but returned 404! Retrying on next account ({transient_404s}/{TRANSIENT_404_RETRIES})...\n")
+                            sys.stderr.flush()
+                            continue
+                    elif fallback_req is not None and not use_fallback:
+                        # Model not enabled for this account: retry the same account on the fallback model
+                        mark_model_unavailable(acc, fallback_req[1])
+                        forced_fallback.add(_account_key(acc))
+                        pending.insert(0, acc)
+                        reason = "not in account model list" if available is not None else "model list unavailable"
+                        sys.stderr.write(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [MODEL FALLBACK] Account {display_account_name(acc)} cannot use {fallback_req[1]} (HTTP 404, {reason})! Retrying with {(build_fallback_request(body, fallback, available) or fallback_req)[2]} (cached {MODEL_UNAVAILABLE_TTL // 60}m)...\n")
+                        sys.stderr.flush()
+                        continue
 
                 # Failover on Google Security Validation Required
                 if _is_validation_error(e.code, err_body):
