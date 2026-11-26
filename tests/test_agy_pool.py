@@ -3910,6 +3910,222 @@ class AgyPoolTest(unittest.TestCase):
             self.assertEqual((status, data), (404, b"nf"))
             self.assertEqual([b["model"] for b in bodies], ["gemini-4-hydrogen-medium"])
 
+    def test_query_quota_license_403_discards_expired_and_other_windows(self):
+        now = time.time()
+        past_iso = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now - 3600))
+        future_iso = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now + 3600))
+        future_7d_iso = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now + 7 * 86400))
+
+        acc = account("acc_free")
+        acc["last_quota"] = {
+            "gemini_weekly": {"fraction": 0.9, "reset_time": past_iso},
+            "third_party_5h": {"fraction": 0.5, "reset_time": future_iso},
+            "third_party_weekly": {"fraction": 0.6, "reset_time": future_iso},
+            "gemini_5h": {"fraction": 0.4, "reset_time": future_iso},
+        }
+        self.save_accounts([acc])
+
+        primary_err = urllib.error.HTTPError(
+            "https://cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary",
+            403, "Forbidden", {},
+            io.BytesIO(
+                b'{"error":{"code":403,"message":"You do not have a valid license of this product.","status":"PERMISSION_DENIED"}}'
+            ),
+        )
+        fallback_resp = mock.MagicMock()
+        fallback_resp.__enter__.return_value = fallback_resp
+        fallback_resp.read.return_value = json.dumps({
+            "models": {
+                "gemini-4-hydrogen-high": {
+                    "quotaInfo": {"remainingFraction": 0.8, "resetTime": future_7d_iso}
+                }
+            },
+            "defaultAgentModelId": "gemini-4-hydrogen-high",
+        }).encode()
+
+        with mock.patch.object(agy_pool, "refresh_token", return_value="test-token"), \
+             mock.patch.object(agy_pool.urllib.request, "urlopen", side_effect=[primary_err, fallback_resp]):
+            res = agy_pool.query_quota(acc)
+
+        self.assertEqual(res.get("plan"), "free")
+        self.assertEqual(res["gemini_5h"]["fraction"], 0.8)
+        self.assertNotIn("gemini_weekly", res)
+        self.assertNotIn("third_party_5h", res)
+        self.assertNotIn("third_party_weekly", res)
+        self.assertNotIn(acc.get("status"), ("auth_error", "validation_required"))
+        self.assertEqual(agy_pool.quota_freshness(acc)["class"], "fresh")
+
+    def test_query_quota_license_403_discards_future_cached_weekly(self):
+        now = time.time()
+        future_3d_iso = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now + 3 * 86400))
+        future_7d_iso = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now + 7 * 86400))
+
+        acc = account("acc_free_future")
+        acc["last_quota"] = {
+            "gemini_weekly": {"fraction": 0.9, "reset_time": future_3d_iso},
+            "third_party_5h": {"fraction": 0.5, "reset_time": future_3d_iso},
+            "third_party_weekly": {"fraction": 0.7, "reset_time": future_3d_iso},
+        }
+        self.save_accounts([acc])
+
+        primary_err = urllib.error.HTTPError(
+            "https://cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary",
+            403, "Forbidden", {},
+            io.BytesIO(
+                b'{"error":{"code":403,"message":"You do not have a valid license of this product.","status":"PERMISSION_DENIED"}}'
+            ),
+        )
+        fallback_resp = mock.MagicMock()
+        fallback_resp.__enter__.return_value = fallback_resp
+        fallback_resp.read.return_value = json.dumps({
+            "models": {
+                "gemini-4-hydrogen-high": {
+                    "quotaInfo": {"remainingFraction": 0.8, "resetTime": future_7d_iso}
+                }
+            },
+            "defaultAgentModelId": "gemini-4-hydrogen-high",
+        }).encode()
+
+        with mock.patch.object(agy_pool, "refresh_token", return_value="test-token"), \
+             mock.patch.object(agy_pool.urllib.request, "urlopen", side_effect=[primary_err, fallback_resp]):
+            res = agy_pool.query_quota(acc)
+
+        self.assertEqual(res.get("plan"), "free")
+        self.assertEqual(res["gemini_5h"]["fraction"], 0.8)
+        self.assertNotIn("gemini_weekly", res)
+        self.assertNotIn("third_party_5h", res)
+        self.assertNotIn("third_party_weekly", res)
+        stored_quota = agy_pool.load_pool()["accounts"][0]["last_quota"]
+        self.assertEqual(stored_quota.get("plan"), "free")
+        self.assertNotIn("gemini_weekly", stored_quota)
+
+    def test_query_quota_successful_summary_clears_free_plan(self):
+        now = time.time()
+        future_5h_iso = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now + 5 * 3600))
+        future_7d_iso = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now + 7 * 86400))
+
+        acc = account("acc_upgraded")
+        acc["last_quota"] = {
+            "plan": "free",
+            "gemini_5h": {"fraction": 0.8, "reset_time": future_7d_iso},
+            "updated_at": int(now),
+        }
+        self.save_accounts([acc])
+
+        summary_resp = mock.MagicMock()
+        summary_resp.__enter__.return_value = summary_resp
+        summary_resp.read.return_value = json.dumps({
+            "groups": [{
+                "buckets": [
+                    {
+                        "bucketId": "gemini-5h",
+                        "window": "5h",
+                        "remainingFraction": 0.9,
+                        "resetTime": future_5h_iso,
+                    },
+                    {
+                        "bucketId": "gemini-weekly",
+                        "window": "weekly",
+                        "remainingFraction": 0.95,
+                        "resetTime": future_7d_iso,
+                    },
+                ]
+            }]
+        }).encode()
+
+        with mock.patch.object(agy_pool, "refresh_token", return_value="test-token"), \
+             mock.patch.object(agy_pool.urllib.request, "urlopen", return_value=summary_resp):
+            res = agy_pool.query_quota(acc)
+
+        self.assertNotIn("plan", res)
+        self.assertNotIn("plan", acc["last_quota"])
+        self.assertNotIn("plan", agy_pool.load_pool()["accounts"][0]["last_quota"])
+        self.assertEqual(res["gemini_5h"]["fraction"], 0.9)
+        self.assertEqual(res["gemini_weekly"]["fraction"], 0.95)
+
+    def test_cached_quota_state_drops_expired_windows_and_guards_legacy(self):
+        now = time.time()
+        past_iso = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now - 3600))
+        future_iso = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now + 3600))
+
+        state = agy_pool._cached_quota_state({
+            "plan": "free",
+            "gemini_5h": {"fraction": 0.8, "reset_time": future_iso},
+            "gemini_weekly": {"fraction": 0.9, "reset_time": past_iso},
+            "third_party_5h": {"fraction": 0.5, "reset_time": past_iso},
+            "third_party_weekly": {"fraction": 0.7, "reset_time": future_iso},
+        })
+        self.assertEqual(state.get("plan"), "free")
+        self.assertEqual(state["gemini_5h"], {"fraction": 0.8, "reset_time": future_iso})
+        self.assertEqual(state["third_party_weekly"], {"fraction": 0.7, "reset_time": future_iso})
+        self.assertNotIn("gemini_weekly", state)
+        self.assertNotIn("third_party_5h", state)
+
+        legacy_state = agy_pool._cached_quota_state({
+            "remaining_fraction": 0.5,
+            "reset_time": future_iso,
+        })
+        self.assertEqual(legacy_state["gemini_5h"], {"fraction": 0.5, "reset_time": future_iso})
+        self.assertEqual(legacy_state["gemini_weekly"], {"fraction": 0.5, "reset_time": future_iso})
+
+        expired_with_legacy = agy_pool._cached_quota_state({
+            "gemini_5h": {"fraction": 0.4, "reset_time": past_iso},
+            "gemini_weekly": {"fraction": 0.6, "reset_time": past_iso},
+            "remaining_fraction": 0.5,
+            "reset_time": future_iso,
+        })
+        self.assertEqual(expired_with_legacy, {})
+
+    def test_is_license_error_predicate(self):
+        license_body = b'{"error":{"code":403,"message":"You do not have a valid license of this product.","status":"PERMISSION_DENIED"}}'
+        self.assertTrue(agy_pool._is_license_error(403, license_body))
+        self.assertTrue(agy_pool._is_license_error(403, license_body.decode("utf-8")))
+        self.assertTrue(agy_pool._is_license_error(403, "Account lacks a VALID LICENSE"))
+        self.assertFalse(agy_pool._is_license_error(403, b'{"error":{"status":"PERMISSION_DENIED"}}'))
+        self.assertFalse(agy_pool._is_license_error(403, b'{"error":{"message":"SUBSCRIPTION_REQUIRED"}}'))
+        self.assertFalse(agy_pool._is_license_error(401, license_body))
+        self.assertFalse(agy_pool._is_license_error(429, license_body))
+
+    def test_list_accounts_renders_free_tier_and_normal_accounts(self):
+        now = time.time()
+        future_5h_iso = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now + 4 * 3600))
+        future_7d_iso = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now + 7 * 86400))
+
+        free_acc = account("free_acc")
+        free_acc["name"] = "FreeUser"
+        free_acc["last_quota"] = {
+            "plan": "free",
+            "gemini_5h": {"fraction": 0.8, "reset_time": future_7d_iso},
+            "updated_at": int(now),
+        }
+
+        paid_acc = account("paid_acc")
+        paid_acc["name"] = "PaidUser"
+        paid_acc["last_quota"] = {
+            "gemini_5h": {"fraction": 0.6, "reset_time": future_5h_iso},
+            "gemini_weekly": {"fraction": 0.9, "reset_time": future_7d_iso},
+            "updated_at": int(now),
+        }
+
+        self.save_accounts([free_acc, paid_acc], active="free_acc")
+        buf = io.StringIO()
+        with mock.patch("sys.stdout", buf), \
+             mock.patch.object(agy_pool, "is_daemon_running", return_value=False), \
+             mock.patch.object(agy_pool, "_safe_quota"):
+            agy_pool.list_accounts()
+
+        clean = agy_pool._ANSI_ESCAPE_RE.sub("", buf.getvalue())
+        free_start = clean.index("[1] FreeUser")
+        paid_start = clean.index("[2] PaidUser")
+        free_block = clean[free_start:paid_start]
+        paid_block = clean[paid_start:]
+
+        self.assertIn("Gemini Free:", free_block)
+        self.assertIn("N/A (free tier)", free_block)
+        self.assertNotIn("Gemini 5-Hour:", free_block)
+        self.assertIn("Gemini 5-Hour:", paid_block)
+        self.assertNotIn("Gemini Free:", paid_block)
+
 
 if __name__ == "__main__":
     unittest.main()

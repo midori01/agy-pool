@@ -5,6 +5,18 @@ All notable changes to the `agy-pool` project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.0-beta.15] - 2026-11-26
+
+### Changed
+- **Free-Tier Quota Display**:
+  - `agy-pool status` / `list` displays `Gemini Free` and `Gemini Weekly: N/A (free tier)` instead of the 5-Hour / Weekly rows for accounts marked with `"plan": "free"`.
+
+### Fixed
+- **Free-Tier Accounts & Expired Cached Quota Windows**:
+  - Accounts without a paid license receive HTTP 403 `"valid license"` from `retrieveUserQuotaSummary`. `agy-pool` now discards cached subscription-era weekly and third-party windows and falls back to `fetchAvailableModels` (`"plan": "free"`), preventing stale subscription windows from remaining cached forever (which showed `"Resets Ready"`, marked the account stale, and lowered its rotation priority).
+  - `_cached_quota_state` now discards cached quota windows whose `reset_time` is already in the past on refresh, while preserving `"plan": "free"` across refreshes and restricting legacy `remaining_fraction` fallback to pools without explicit window keys.
+  - Added unit tests covering license 403 handling, future/expired window eviction, free-to-paid plan clearing, `_cached_quota_state`, `_is_license_error`, and status rendering (147/147 passing).
+
 ## [0.1.0-beta.14] - 2026-11-25
 
 ### Changed

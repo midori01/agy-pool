@@ -65,7 +65,7 @@ except ImportError:
     HAS_TERMIOS = False
 
 # ----------------- Constants & Configuration -----------------
-VERSION = "0.1.0-beta.14"
+VERSION = "0.1.0-beta.15"
 QUOTA_FRESH_MAX_AGE = 60
 QUOTA_AGING_MAX_AGE = 300
 _QUOTA_REFRESH_LOCK = threading.Lock()
@@ -1006,6 +1006,14 @@ def _extract_validation_url(body):
     return None
 
 
+def _is_license_error(status, body):
+    """403 for an account without a paid Antigravity license (free tier): no quota summary is available."""
+    if status != 403:
+        return False
+    text = body.decode("utf-8", errors="ignore").lower() if isinstance(body, (bytes, bytearray)) else str(body).lower()
+    return "valid license" in text
+
+
 def _is_quota_error(status, body):
     if status == 429:
         return True
@@ -1093,15 +1101,24 @@ def _cached_quota_state(last_quota):
     """Copy known cached windows without manufacturing unknown capacity."""
     old = last_quota if isinstance(last_quota, dict) else {}
     result = {}
-    for key in ("gemini_5h", "gemini_weekly", "third_party_5h", "third_party_weekly"):
+    now = time.time()
+    window_keys = ("gemini_5h", "gemini_weekly", "third_party_5h", "third_party_weekly")
+    for key in window_keys:
         window = old.get(key)
         fraction = _quota_fraction(window.get("fraction")) if isinstance(window, dict) else None
-        if fraction is not None:
-            result[key] = {"fraction": fraction, "reset_time": window.get("reset_time")}
+        if fraction is None:
+            continue
+        reset = _parse_iso_or_timestamp(window.get("reset_time"))
+        if reset is not None and reset <= now:
+            # The window has rolled over since it was cached; its fraction no longer applies
+            continue
+        result[key] = {"fraction": fraction, "reset_time": window.get("reset_time")}
+    if old.get("plan") == "free":
+        result["plan"] = "free"
 
     # Legacy pools stored only the combined fraction. Preserve their old usable
     # scheduling behavior when a later refresh supplies just one explicit window.
-    if "gemini_5h" not in result and "gemini_weekly" not in result:
+    if not any(key in old for key in window_keys):
         legacy = _quota_fraction(old.get("remaining_fraction"))
         if legacy is not None:
             reset = old.get("reset_time")
@@ -1203,6 +1220,7 @@ def query_quota(account, force_refresh_token=False):
                         quota_data["third_party_weekly"] = {"fraction": fraction, "reset_time": reset}
         if not found_quota:
             raise ValueError("quota response contained no Gemini quota buckets")
+        quota_data.pop("plan", None)
 
     except urllib.error.HTTPError as e:
         quota_error = e
@@ -1243,6 +1261,9 @@ def query_quota(account, force_refresh_token=False):
                     stored["last_quota"] = quota_data
             pool_transaction(update)
             return quota_data
+        if _is_license_error(e.code, err_body):
+            # Free tier: subscription-era windows are gone; only the per-model quota applies
+            quota_data = {"plan": "free"}
         try:
             _fetch_available_models_quota(headers, quota_data)
         except Exception as fallback_error:
@@ -1922,8 +1943,12 @@ def list_accounts(target=None, show_email=None):
             print(f"    • Gemini Weekly: {CLR_RED}[░░░░░░░░░░]  Authentication Failure{CLR_RESET}")
             print(f"    {CLR_RED}↳ Token expired or revoked. Re-authenticate account.{CLR_RESET}")
         else:
-            print(f"    • Gemini 5-Hour: {g5_bar}  (Resets {g5_reset})")
-            print(f"    • Gemini Weekly: {gw_bar}  (Resets {gw_reset})")
+            if q.get("plan") == "free":
+                print(f"    • Gemini Free:   {g5_bar}  (Resets {g5_reset})")
+                print(f"    • Gemini Weekly: {CLR_DIM}N/A (free tier){CLR_RESET}")
+            else:
+                print(f"    • Gemini 5-Hour: {g5_bar}  (Resets {g5_reset})")
+                print(f"    • Gemini Weekly: {gw_bar}  (Resets {gw_reset})")
 
             if tp5 and tp5.get("fraction") is not None and tp5.get("fraction") < 1.0:
                 tp_bar = render_progress_bar(tp5.get("fraction"), width=10)
