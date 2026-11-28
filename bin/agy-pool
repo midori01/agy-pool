@@ -65,7 +65,7 @@ except ImportError:
     HAS_TERMIOS = False
 
 # ----------------- Constants & Configuration -----------------
-VERSION = "0.1.0-beta.15"
+VERSION = "1.0.0"
 QUOTA_FRESH_MAX_AGE = 60
 QUOTA_AGING_MAX_AGE = 300
 _QUOTA_REFRESH_LOCK = threading.Lock()
@@ -3459,13 +3459,18 @@ def compute_capacity_state(account, now=None):
         remaining = timestamp - now
         return 1.0 if remaining <= 0 else min(1.0, remaining / window_seconds)
 
-    r5 = reset_ratio("gemini_5h_reset_sec", reset5, WINDOW_5H_SECS)
+    # Free-tier accounts carry one per-model window that resets weekly, stored in the 5h slot
+    free_plan = quota.get("plan") == "free"
+    r5 = reset_ratio("gemini_5h_reset_sec", reset5, WINDOW_7D_SECS if free_plan else WINDOW_5H_SECS)
     r7 = reset_ratio("gemini_weekly_reset_sec", reset7, WINDOW_7D_SECS)
     pace5 = q5 - r5 if q5 is not None else None
     pace7 = q7 - r7 if q7 is not None else None
     known_paces = [pace for pace in (pace5, pace7) if pace is not None]
     known_fractions = [fraction for fraction in (q5, q7) if fraction is not None]
-    known_window_count = 1 if legacy_fraction_known else q5_known + q7_known
+    if free_plan and q5_known:
+        known_window_count = 2
+    else:
+        known_window_count = 1 if legacy_fraction_known else q5_known + q7_known
     worst_pace = min(known_paces) if known_paces else float("-inf")
     total_pace = sum(known_paces) if known_paces else float("-inf")
     raw_floor = min(known_fractions) if known_fractions else 0.0
@@ -3890,6 +3895,9 @@ def simulate_quota_runway(pool, pace_gens_per_hour=None, now=None, sim_hours=168
 
         g5 = q.get("gemini_5h", {}) if isinstance(q, dict) else {}
         gw = q.get("gemini_weekly", {}) if isinstance(q, dict) else {}
+        if isinstance(q, dict) and q.get("plan") == "free" and isinstance(g5, dict) and g5:
+            qw, q5 = q5, 1.0
+            gw, g5 = g5, {}
         reset5 = g5.get("reset_time") if isinstance(g5, dict) else None
         resetw = gw.get("reset_time") if isinstance(gw, dict) else None
         if not reset5 and not resetw:

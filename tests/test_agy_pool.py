@@ -4126,6 +4126,155 @@ class AgyPoolTest(unittest.TestCase):
         self.assertIn("Gemini 5-Hour:", paid_block)
         self.assertNotIn("Gemini Free:", paid_block)
 
+    def test_compute_capacity_state_free_tier_uses_7d_window(self):
+        now = time.time()
+        reset_3_5d_iso = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now + 3.5 * 86400))
+
+        free_acc = account("free_cap")
+        free_acc["last_quota"] = {
+            "plan": "free",
+            "gemini_5h": {"fraction": 0.6, "reset_time": reset_3_5d_iso},
+        }
+        cap_free = agy_pool.compute_capacity_state(free_acc, now=now)
+        self.assertAlmostEqual(cap_free["r5"], 0.5, places=4)
+        self.assertAlmostEqual(cap_free["pace5"], 0.1, places=4)
+        self.assertEqual(cap_free["known_window_count"], 2)
+
+        paid_partial = account("paid_partial")
+        paid_partial["last_quota"] = {
+            "gemini_5h": {"fraction": 0.6, "reset_time": reset_3_5d_iso},
+        }
+        cap_paid = agy_pool.compute_capacity_state(paid_partial, now=now)
+        self.assertEqual(cap_paid["r5"], 1.0)
+        self.assertEqual(cap_paid["known_window_count"], 1)
+
+    def test_order_candidates_max_quota_free_tier_pace_ranking(self):
+        now = time.time()
+        def iso_at(offset_sec):
+            return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now + offset_sec))
+
+        paid_pos = account("paid_pos")
+        paid_pos["last_quota"] = {
+            "gemini_5h": {"fraction": 0.9, "reset_time": iso_at(2.5 * 3600)},
+            "gemini_weekly": {"fraction": 0.9, "reset_time": iso_at(3.5 * 86400)},
+            "updated_at": int(now),
+        }
+
+        free_full = account("free_full")
+        free_full["last_quota"] = {
+            "plan": "free",
+            "gemini_5h": {"fraction": 1.0, "reset_time": iso_at(7 * 86400)},
+            "updated_at": int(now),
+        }
+
+        paid_neg = account("paid_neg")
+        paid_neg["last_quota"] = {
+            "gemini_5h": {"fraction": 0.2, "reset_time": iso_at(4.5 * 3600)},
+            "gemini_weekly": {"fraction": 0.3, "reset_time": iso_at(6 * 86400)},
+            "updated_at": int(now),
+        }
+
+        ordered = agy_pool.order_candidates(
+            [paid_neg, free_full, paid_pos],
+            strategy="max_quota",
+            now=now,
+            in_flight_counts={},
+        )
+        self.assertEqual([a["id"] for a in ordered], ["paid_pos", "free_full", "paid_neg"])
+
+    def test_order_candidates_least_used_free_tier_equal_hits(self):
+        now = time.time()
+        def iso_at(offset_sec):
+            return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now + offset_sec))
+
+        paid_pos = account("paid_pos")
+        paid_pos["gen_count"] = 5
+        paid_pos["last_quota"] = {
+            "gemini_5h": {"fraction": 0.9, "reset_time": iso_at(2.5 * 3600)},
+            "gemini_weekly": {"fraction": 0.9, "reset_time": iso_at(3.5 * 86400)},
+            "updated_at": int(now),
+        }
+
+        free_full = account("free_full")
+        free_full["gen_count"] = 5
+        free_full["last_quota"] = {
+            "plan": "free",
+            "gemini_5h": {"fraction": 1.0, "reset_time": iso_at(7 * 86400)},
+            "updated_at": int(now),
+        }
+
+        paid_neg = account("paid_neg")
+        paid_neg["gen_count"] = 5
+        paid_neg["last_quota"] = {
+            "gemini_5h": {"fraction": 0.2, "reset_time": iso_at(4.5 * 3600)},
+            "gemini_weekly": {"fraction": 0.3, "reset_time": iso_at(6 * 86400)},
+            "updated_at": int(now),
+        }
+
+        ordered = agy_pool.order_candidates(
+            [paid_neg, free_full, paid_pos],
+            strategy="least_used",
+            now=now,
+            in_flight_counts={},
+        )
+        ids = [a["id"] for a in ordered]
+        self.assertEqual(ids, ["paid_pos", "free_full", "paid_neg"])
+        self.assertLess(ids.index("free_full"), ids.index("paid_neg"))
+
+        free_full["gen_count"] = 1
+        ordered_hits = agy_pool.order_candidates(
+            [paid_neg, free_full, paid_pos],
+            strategy="least_used",
+            now=now,
+            in_flight_counts={},
+        )
+        self.assertEqual([a["id"] for a in ordered_hits], ["free_full", "paid_pos", "paid_neg"])
+
+    def test_simulate_quota_runway_free_tier_weekly_bottleneck(self):
+        now = time.time()
+        reset_3d_iso = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now + 3 * 86400))
+
+        free_acc = account("free_only")
+        free_acc["last_quota"] = {
+            "plan": "free",
+            "gemini_5h": {"fraction": 0.5, "reset_time": reset_3d_iso},
+            "updated_at": int(now),
+        }
+        free_res = agy_pool.simulate_quota_runway(
+            {"accounts": [free_acc], "strategy": "max_quota"},
+            pace_gens_per_hour=30.0,
+            now=now,
+        )
+        free_runway = free_res["current_runway"]
+        self.assertIsNotNone(free_runway["first_stall_sec"])
+        self.assertEqual(free_runway["first_stall_cause"], "weekly")
+        self.assertFalse(free_runway["is_sustainable_weekly"])
+        self.assertIsNotNone(free_runway["weekly_exhaust_sec"])
+        self.assertTrue(free_runway["is_sustainable_5h"])
+        self.assertIsNone(free_runway["first_empty_acc_id"])
+        self.assertEqual(free_res["accounts_forecast"][0]["qw_pct"], 50.0)
+        self.assertLess(free_res["accounts_forecast"][0]["resetw_in_sec"], 4 * 86400)
+
+        paid_acc = account("paid_only")
+        paid_acc["last_quota"] = {
+            "gemini_5h": {"fraction": 0.5, "reset_time": reset_3d_iso},
+            "updated_at": int(now),
+        }
+        paid_res = agy_pool.simulate_quota_runway(
+            {"accounts": [paid_acc], "strategy": "max_quota"},
+            pace_gens_per_hour=30.0,
+            now=now,
+        )
+        paid_runway = paid_res["current_runway"]
+        self.assertEqual(paid_runway["first_stall_cause"], "5h")
+        self.assertFalse(paid_runway["is_sustainable_5h"])
+        self.assertEqual(paid_runway["first_empty_acc_id"], "paid_only")
+        self.assertTrue(paid_runway["is_sustainable_weekly"])
+        self.assertIsNone(paid_runway["weekly_exhaust_sec"])
+        self.assertEqual(paid_res["accounts_forecast"][0]["q5_pct"], 50.0)
+        self.assertEqual(paid_res["accounts_forecast"][0]["qw_pct"], 100.0)
+        self.assertGreater(paid_res["accounts_forecast"][0]["resetw_in_sec"], 6 * 86400)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -5,6 +5,16 @@ All notable changes to the `agy-pool` project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.0.0] - 2026-11-28
+
+First stable release, ending the 0.1.0 beta series. From here on agy-pool follows Semantic Versioning: bug fixes bump the patch version, backward-compatible features bump the minor version, and incompatible changes to commands, configuration or storage format bump the major version.
+
+### Fixed
+- **Free-Tier Rotation Pace & Runway Forecast**:
+  - `compute_capacity_state` now evaluates free-tier accounts (`"plan": "free"`) against the 7-day window (`WINDOW_7D_SECS`) instead of the 5-hour window and assigns `known_window_count = 2` when the free quota fraction is known, preventing `max_quota` and `least_used` from forcing free accounts behind every paid account regardless of pace.
+  - `simulate_quota_runway` now models a free account's window as its weekly budget (`qw` and weekly `reset_time`) while leaving the 5-hour slot unconstrained (`q5 = 1.0`), instead of modeling it as a 5-hour window refilling every 5 hours alongside a phantom 100% weekly budget.
+  - Added unit tests for free-tier capacity state, `max_quota` and `least_used` candidate ordering against paid accounts, and weekly-bottlenecked runway simulation (151/151 passing).
+
 ## [0.1.0-beta.15] - 2026-11-26
 
 ### Changed

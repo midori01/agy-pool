@@ -1,6 +1,6 @@
 # agy-pool: Antigravity Multi-Account Quota Pool & Intelligent Load Balancer Suite
 
-[![Version](https://img.shields.io/badge/version-0.1.0--beta.15-blue.svg)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-1.0.0-blue.svg)](CHANGELOG.md)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Platform](https://img.shields.io/badge/platform-Termux%20%7C%20Linux%20%7C%20macOS-green.svg)](#)
 [![Python: 3.8+](https://img.shields.io/badge/python-3.8+-blue.svg)](#)
@@ -150,6 +150,8 @@ export AGY_FALLBACK_MODEL="off"
 ### Free-Tier Accounts
 
 Accounts without a paid license (free tier) return HTTP 403 (`"valid license"`) from `retrieveUserQuotaSummary`. `agy-pool` falls back to `fetchAvailableModels` and renders the per-model free quota as `Gemini Free` (about a 7-day window) with `Gemini Weekly` shown as `N/A (free tier)`. On quota refresh, any expired cached windows whose reset time has already passed are discarded.
+
+Free-tier windows are rolling (they start at first use, so an untouched window always shows 100% with about 7 days left), and rotation treats the free window as a complete 7-day window so free accounts compete on reset-aware pace with paid accounts instead of always ranking last. Paid accounts with spare quota that would expire at their reset go first, free accounts step in ahead of paid accounts running behind their pace, and the runway forecast models the free window as a weekly budget.
 
 ---
 
